@@ -16,7 +16,6 @@ from database import (
     update_bet_result,
 )
 from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
-from local_ai import analyze_play_with_ollama
 from scanner_logic import (
     expected_value_pct,
     deduplicate_alt_line_ladders,
@@ -510,18 +509,6 @@ with tab_ev:
             f"{line_adjusted_kelly_fraction:.1%} Kelly; "
             "stakes round down to cents."
         )
-
-        with st.expander("Ask local AI about a listed price"):
-            option_labels = [
-                f"{quote['matchup']} · {quote['selection']} · {quote['sportsbook']}"
-                for quote in ev_opportunities
-            ]
-            selected_index = st.selectbox(
-                "Choose a +EV quote", range(len(option_labels)), format_func=lambda i: option_labels[i]
-            )
-            if st.button("Analyze selected quote"):
-                with st.spinner("Asking the local Ollama model..."):
-                    st.info(analyze_play_with_ollama(ev_opportunities[selected_index]))
 
 with tab_arb:
     st.subheader("Arbitrage opportunities")
