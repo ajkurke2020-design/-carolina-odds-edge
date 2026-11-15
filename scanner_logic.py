@@ -565,6 +565,7 @@ def scan_pinnacle_ev(
             "missing_start_time": 0,
             "invalid_pinnacle_market": 0,
             "below_min_ev": 0,
+            "below_min_liquidity": 0,
             "alt_line_duplicate": 0,
         },
         "rows_kept": 0,
@@ -705,6 +706,19 @@ def scan_pinnacle_ev(
         if missing_start:
             diagnostics["dropped"]["missing_start_time"] += 1
             continue
+        liquidity = quote.get("liquidity")
+        if liquidity is not None and not isinstance(liquidity, bool):
+            try:
+                liquidity_dollars = float(liquidity)
+            except (TypeError, ValueError):
+                liquidity_dollars = None
+            if (
+                liquidity_dollars is not None
+                and isfinite(liquidity_dollars)
+                and liquidity_dollars < config.min_liquidity_dollars
+            ):
+                diagnostics["dropped"]["below_min_liquidity"] += 1
+                continue
 
         key = _reference_key(quote)
         reference = valid_references.get(key)

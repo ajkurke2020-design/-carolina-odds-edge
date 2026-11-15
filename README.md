@@ -15,9 +15,9 @@ upcoming scans show events whose kickoff is still in the future in US Eastern
 time, while live scans show events marked live and not completed by the API.
 Event times are displayed in US Eastern time (`America/New_York`). Requests
 include the configured North Carolina venues (DraftKings, FanDuel, BetMGM,
-Fanatics, theScore Bet, Underdog, Kalshi, Polymarket, Polymarket US, Novig, and
-ProphetX) and Pinnacle. Pinnacle is collected only as a sharp reference and
-never shown as a bettable venue. No automatic retry is
+Fanatics, theScore Bet, Underdog, Novig, and ProphetX) and Pinnacle. Pinnacle
+is collected only as a sharp reference and never shown as a bettable venue.
+No automatic retry is
 made when a rate or daily quota limit is reached.
 Each sport is fetched in its own HTTPS session, with up to three sports in
 flight at once. Direct PropLine connections use the host's IPv4 address because
@@ -99,7 +99,9 @@ when you want a refreshed snapshot; responses are not polled in the background.
 - Quotes older than the configured age, markets over the overround limit, and
   already-started events are excluded. Rows with EV above 15% remain visible
   with a `verify` flag. Each scan reports fetched/kept counts, drop reasons,
-  and the minimum, median, and maximum EV.
+  and the minimum, median, and maximum EV. Reported venue liquidity below the
+  configured `min_liquidity_dollars` threshold is excluded; the default is
+  `$0`, and quotes without a liquidity value are not filtered.
 - For non-push lines, EV is `(decimal odds * fair probability - 1) * 100`.
   For whole-number spread/total lines, the model estimates win, lose, and push
   probabilities and uses `win_p * (decimal odds - 1) - lose_p`; a push returns
@@ -129,15 +131,13 @@ when you want a refreshed snapshot; responses are not polled in the background.
 
 The app cannot ensure a quote is still available or that every leg is accepted.
 Arbitrage calculations exclude limits, rejected wagers, price movement, fees,
-and settlement-rule differences. Prediction-market fees and bid/ask spreads
-are also not deducted from +EV calculations. Verify prices, fees, and market
-rules at each venue before acting.
+and settlement-rule differences. Exchange fees and bid/ask spreads are not
+deducted from +EV calculations. Verify prices, fees, and market rules at each
+venue before acting.
 
-PropLine's odds feed supplies `price` as American odds, including for Kalshi,
-Polymarket, Polymarket US, Novig, and ProphetX. The app keeps that source price
-and converts it once to decimal odds for EV and arbitrage math; it does not
-treat a contract's cents/probability as an American price. Where PropLine
-provides exchange liquidity and its update time, these are retained and shown
-with the quote. Liquidity does not cap the suggested arbitrage stake, and
-exchange fees are not included. Underdog's source price is used as provided;
-its payout multiplier is metadata and is not applied a second time.
+PropLine's odds feed supplies `price` as American odds. The app keeps that
+source price and converts it once to decimal odds for EV and arbitrage math.
+Where PropLine provides exchange liquidity and its update time, these are
+retained with the quote. Liquidity does not cap the suggested arbitrage stake,
+and exchange fees are not included. Underdog's source price is used as
+provided; its payout multiplier is metadata and is not applied a second time.

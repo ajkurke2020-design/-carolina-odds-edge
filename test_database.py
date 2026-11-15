@@ -1,6 +1,8 @@
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -77,6 +79,32 @@ class OpportunityLogTests(unittest.TestCase):
         self.assertAlmostEqual(log.loc[0, "closing_fair_probability"], 0.55)
         self.assertAlmostEqual(log.loc[0, "clv_pct"], 32.0)
         self.assertEqual(log.loc[0, "closing_quote_time"], "2026-01-01T12:59:30+00:00")
+
+    def test_init_db_configures_wal_and_busy_timeout(self):
+        pragmas = []
+        original_connect = sqlite3.connect
+
+        class RecordingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                result = super().execute(sql, parameters)
+                if sql in ("PRAGMA journal_mode=WAL;", "PRAGMA busy_timeout=5000;"):
+                    pragmas.append((sql, result.fetchone()[0]))
+                return result
+
+        def recording_connect(*args, **kwargs):
+            kwargs["factory"] = RecordingConnection
+            return original_connect(*args, **kwargs)
+
+        with patch.object(database.sqlite3, "connect", side_effect=recording_connect):
+            database.init_db()
+
+        self.assertEqual(
+            pragmas,
+            [
+                ("PRAGMA journal_mode=WAL;", "wal"),
+                ("PRAGMA busy_timeout=5000;", 5000),
+            ],
+        )
 
     def test_line_adjusted_clv_uses_closing_pinnacle_lines_at_venue_line(self):
         opportunity = {

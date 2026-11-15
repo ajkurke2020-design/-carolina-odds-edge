@@ -319,6 +319,31 @@ class PinnacleFairProbabilityTests(unittest.TestCase):
             betmgm_result["opportunities"][0]["fair_probability"],
         )
 
+    def test_minimum_liquidity_filters_only_reported_values_below_threshold(self):
+        config = replace(CONFIG, min_liquidity_dollars=100.0)
+        quotes = two_way_quotes(book_a=2.5)
+        pinnacle_quotes = quotes[:2]
+        low_liquidity_quote = quotes[2]
+        low_liquidity_quote["liquidity"] = 99.99
+
+        filtered = scan_pinnacle_ev(
+            pinnacle_quotes + [low_liquidity_quote], config=config, now=NOW
+        )
+        self.assertEqual(filtered["opportunities"], [])
+        self.assertEqual(filtered["diagnostics"]["dropped"]["below_min_liquidity"], 1)
+
+        for liquidity in (None, 100.0):
+            with self.subTest(liquidity=liquidity):
+                eligible_quote = quote("DraftKings", "Home", 2.5)
+                eligible_quote["liquidity"] = liquidity
+                result = scan_pinnacle_ev(
+                    pinnacle_quotes + [eligible_quote], config=config, now=NOW
+                )
+                self.assertEqual(len(result["opportunities"]), 1)
+                self.assertEqual(
+                    result["diagnostics"]["dropped"]["below_min_liquidity"], 0
+                )
+
     def test_alt_line_ladder_keeps_only_the_highest_ev_selection_rung(self):
         quotes = []
         for line, book_odds in ((1.5, 2.5), (2.5, 2.1)):

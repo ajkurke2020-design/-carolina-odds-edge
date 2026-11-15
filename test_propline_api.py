@@ -25,9 +25,6 @@ class PropLineApiTests(unittest.TestCase):
                 "fanatics": "Fanatics",
                 "thescorebet": "theScore Bet",
                 "underdog": "Underdog",
-                "polymarket": "Polymarket",
-                "polymarket_us": "Polymarket US",
-                "kalshi": "Kalshi",
                 "novig": "Novig",
                 "prophetx": "ProphetX",
             },
@@ -39,16 +36,15 @@ class PropLineApiTests(unittest.TestCase):
         self.assertIsNone(american_to_decimal(0))
         self.assertIsNone(american_to_decimal("110"))
 
-    def test_prediction_market_prices_are_american_and_keep_quote_liquidity(self):
-        prediction_books = ("polymarket", "polymarket_us", "kalshi")
+    def test_approved_bookmaker_quotes_keep_reported_liquidity(self):
         events = [
             {
-                "id": f"event-{bookmaker}",
+                "id": "event-draftkings",
                 "home_team": "Home",
                 "away_team": "Away",
                 "bookmakers": [
                     {
-                        "key": bookmaker,
+                        "key": "draftkings",
                         "markets": [
                             {
                                 "key": "h2h",
@@ -66,21 +62,20 @@ class PropLineApiTests(unittest.TestCase):
                     }
                 ],
             }
-            for bookmaker in prediction_books
         ]
 
         quotes = parse_odds_payload(events, "NFL")
 
-        self.assertEqual(len(quotes), len(prediction_books))
-        for quote in quotes:
-            self.assertEqual(quote["selection"], "Home")
-            self.assertEqual(quote["odds_american"], 125)
-            self.assertEqual(quote["price_format"], "american")
-            self.assertEqual(quote["odds_decimal"], 2.25)
-            self.assertEqual(quote["liquidity"], 40.5)
-            self.assertEqual(
-                quote["liquidity_updated_at"], "2026-11-13T10:00:00Z"
-            )
+        self.assertEqual(len(quotes), 1)
+        self.assertEqual(quotes[0]["sportsbook"], "DraftKings")
+        self.assertEqual(quotes[0]["selection"], "Home")
+        self.assertEqual(quotes[0]["odds_american"], 125)
+        self.assertEqual(quotes[0]["price_format"], "american")
+        self.assertEqual(quotes[0]["odds_decimal"], 2.25)
+        self.assertEqual(quotes[0]["liquidity"], 40.5)
+        self.assertEqual(
+            quotes[0]["liquidity_updated_at"], "2026-11-13T10:00:00Z"
+        )
 
     def test_underdog_price_is_not_adjusted_again_by_payout_multiplier(self):
         events = [
@@ -418,45 +413,6 @@ class PropLineApiTests(unittest.TestCase):
                         ],
                     },
                     {
-                        "key": "polymarket",
-                        "title": "Polymarket",
-                        "markets": [
-                            {
-                                "key": "h2h",
-                                "outcomes": [
-                                    {"name": "Home", "price": 120},
-                                    {"name": "Away", "price": -130},
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "key": "polymarket_us",
-                        "title": "Polymarket US",
-                        "markets": [
-                            {
-                                "key": "h2h",
-                                "outcomes": [
-                                    {"name": "Home", "price": 120},
-                                    {"name": "Away", "price": -130},
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "key": "kalshi",
-                        "title": "Kalshi",
-                        "markets": [
-                            {
-                                "key": "h2h",
-                                "outcomes": [
-                                    {"name": "Home", "price": 120},
-                                    {"name": "Away", "price": -130},
-                                ],
-                            }
-                        ],
-                    },
-                    {
                         "key": "novig",
                         "title": "Novig",
                         "markets": [
@@ -483,8 +439,8 @@ class PropLineApiTests(unittest.TestCase):
                         ],
                     },
                     {
-                        "key": "hardrock",
-                        "title": "Hard Rock",
+                        "key": "unapproved_provider",
+                        "title": "Unapproved Provider",
                         "markets": [
                             {
                                 "key": "h2h",
@@ -531,9 +487,6 @@ class PropLineApiTests(unittest.TestCase):
                 "Fanatics",
                 "theScore Bet",
                 "Underdog",
-                "Polymarket",
-                "Polymarket US",
-                "Kalshi",
                 "Novig",
                 "ProphetX",
             },

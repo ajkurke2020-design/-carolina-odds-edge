@@ -162,14 +162,41 @@ if "ev_candidates" not in st.session_state:
     st.session_state["ev_candidates"] = []
 if "last_scan" not in st.session_state:
     st.session_state["last_scan"] = None
+if "quota" not in st.session_state:
+    st.session_state["quota"] = {}
 if "selected_books" not in st.session_state:
     st.session_state["selected_books"] = DEFAULT_BOOKS
 if "pending_book_selection" in st.session_state:
     st.session_state["selected_books"] = st.session_state.pop("pending_book_selection")
 
+quota_status = st.session_state.get("quota") or {}
+quota_remaining = quota_status.get("X-Daily-Remaining")
+quota_limit = quota_status.get("X-Daily-Limit")
+if quota_remaining is None:
+    quota_text = "Not reported"
+elif quota_limit is None:
+    quota_text = str(quota_remaining)
+else:
+    quota_text = f"{quota_remaining} of {quota_limit}"
+last_scan_status = st.session_state.get("last_scan")
+last_scan_time = (
+    last_scan_status.get("time", "Unavailable")
+    if last_scan_status
+    else "Not scanned yet"
+)
+with st.sidebar.container(border=True):
+    st.markdown("**System status**")
+    scan_mode = st.segmented_control(
+        "Scan mode (US Eastern)",
+        ["Upcoming", "Live"],
+        default="Upcoming",
+        key="scan_mode",
+    )
+    st.caption(f"PropLine quota remaining: {quota_text}")
+    st.caption(f"Last scan: {last_scan_time}")
+
 st.sidebar.header("Scan setup")
 selected_sports = st.sidebar.multiselect("Sports", SPORTS, default=SPORTS)
-scan_mode = st.sidebar.radio("Schedule (US Eastern)", ["Upcoming", "Live"])
 
 st.session_state["quotes"] = [
     quote
@@ -224,7 +251,7 @@ with header:
     st.caption("Odds comparison, estimated value, and arbitrage opportunities")
 with scan_action:
     st.markdown('<span class="edge-pill">PROPLINE API</span>', unsafe_allow_html=True)
-    scan_button = st.button("Scan odds", type="primary", use_container_width=True)
+    scan_button = st.button("Scan odds", type="primary", width="stretch")
 
 server_api_key = _configured_secret("PROPLINE_API_KEY")
 if server_api_key:
@@ -340,7 +367,31 @@ if last_scan:
 else:
     st.caption("Run a scan to load real PropLine prices. No sample prices are shown.")
 
+with st.container(horizontal=True, vertical_alignment="bottom"):
+    matchup_search = st.text_input(
+        "Search matchups",
+        type="search",
+        placeholder="Search teams or matchups",
+        key="matchup_search",
+    )
+    minimum_ev_filter = st.slider(
+        "Minimum EV %",
+        min_value=float(CONFIG.min_ev_pct),
+        max_value=100.0,
+        value=float(CONFIG.min_ev_pct),
+        step=0.5,
+        format="%.1f%%",
+        key="minimum_ev_filter",
+    )
+
 filtered_quotes = filter_quotes(all_quotes, selected_sports, selected_books)
+search_term = matchup_search.strip().casefold()
+if search_term:
+    filtered_quotes = [
+        quote
+        for quote in filtered_quotes
+        if search_term in str(quote.get("matchup") or "").casefold()
+    ]
 ev_candidates = filter_quotes(
     st.session_state.get("ev_candidates", []),
     selected_sports,
@@ -355,7 +406,18 @@ ev_candidates = [
     for quote in ev_candidates
     if (quote["sport"], quote["event_id"]) in visible_events
 ]
+if search_term:
+    ev_candidates = [
+        quote
+        for quote in ev_candidates
+        if search_term in str(quote.get("matchup") or "").casefold()
+    ]
 ev_opportunities, _ = deduplicate_alt_line_ladders(ev_candidates)
+ev_opportunities = [
+    quote
+    for quote in ev_opportunities
+    if quote["ev_pct"] >= minimum_ev_filter
+]
 ev_opportunities.sort(key=lambda quote: quote["ev_pct"], reverse=True)
 for opportunity in ev_opportunities:
     if opportunity["pricing_method"] == "line-adjusted":
@@ -397,6 +459,7 @@ if diagnostics:
             "missing_start_time": "Missing start time",
             "invalid_pinnacle_market": "Invalid Pinnacle market",
             "below_min_ev": "Below minimum EV",
+            "below_min_liquidity": "Below minimum liquidity",
             "alt_line_duplicate": "Lower-EV alternate-line duplicate",
         }
         dropped = diagnostics["dropped"]
@@ -408,7 +471,8 @@ if diagnostics:
                 ]
             ),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
+            alt="Latest scan drop reasons and quote counts",
         )
 
 matchup_count = len({quote["event_id"] for quote in filtered_quotes})
@@ -435,17 +499,18 @@ with tab_ev:
         "as a bettable row. Quotes below the "
         f"{CONFIG.min_ev_pct:.1f}% minimum are excluded; edges over "
         f"{CONFIG.verify_ev_pct:.0f}% are flagged for verification rather than hidden. "
-        "Kelly stakes are quarter-Kelly by default, capped per bet and per event.</p>",
+        "Kelly stakes are quarter-Kelly by default, capped per bet and per event. "
+        "Use the quick filters above to narrow matchups and raise the minimum EV.</p>",
         unsafe_allow_html=True,
     )
     if not all_quotes:
         st.info("No odds loaded yet. Choose sports in the sidebar and run a scan.")
     elif not filtered_quotes:
-        st.info("No quotes match the selected sports and venues.")
+        st.info("No quotes match the selected sports, venues, or matchup search.")
     elif not ev_opportunities:
         st.info(
-            f"No selected quotes meet the configured +EV minimum of "
-            f"{CONFIG.min_ev_pct:.1f}% with an eligible Pinnacle reference."
+            f"No selected quotes meet the {minimum_ev_filter:.1f}% minimum EV "
+            "filter with an eligible Pinnacle reference."
         )
     else:
         table_rows = []
@@ -456,45 +521,61 @@ with tab_ev:
                     "Matchup": quote["matchup"],
                     "Start (ET)": _format_kickoff_et(quote["kickoff"]),
                     "Market": f"{quote['market']} · {quote['period']}".strip(" ·"),
-                    "Pinnacle line(s)": quote.get("pinnacle_lines_used", ""),
-                    "Venue line": quote.get("line"),
-                    "Period": quote.get("period", ""),
                     "Selection": quote["selection"],
                     "Book / venue": quote["sportsbook"],
-                    "Decimal": f"{quote['odds_decimal']:.2f}",
-                    "American": f"{decimal_to_american(quote['odds_decimal']):+d}",
-                    "Quote liquidity": quote.get("liquidity"),
-                    "Liquidity updated": quote.get("liquidity_updated_at"),
-                    "Pinnacle American (selection)": (
-                        f"{int(quote['pinnacle_american_this_side']):+d}"
-                    ),
-                    "Pinnacle American (opposite)": (
-                        f"{int(quote['pinnacle_american_other_side']):+d}"
-                    ),
-                    "Pinnacle overround": f"{quote['pinnacle_overround']:.4f}",
-                    "Pinnacle quote time": _format_quote_time_et(
-                        quote["pinnacle_quote_time"]
-                    ),
-                    "Book quote time": _format_quote_time_et(
-                        quote["book_quote_time"]
-                    ),
-                    "Fair %": f"{quote['fair_probability']:.1%}",
-                    "Win %": f"{quote['win_probability']:.1%}",
-                    "Push %": f"{quote['push_probability']:.1%}",
-                    "Lose %": f"{quote['lose_probability']:.1%}",
-                    "Implied %": f"{1 / quote['odds_decimal']:.1%}",
-                    "Reference": quote["reference"],
-                    "EV %": f"{quote['ev_pct']:+.2f}%",
-                    "EV / $100": f"${quote['ev_per_100']:+.2f}",
-                    "Kelly stake": f"${recommended_stake:.2f}",
+                    "American": decimal_to_american(quote["odds_decimal"]),
+                    "Decimal": float(quote["odds_decimal"]),
+                    "EV %": float(quote["ev_pct"]),
+                    "Kelly stake": float(recommended_stake),
+                    "Liquidity": quote.get("liquidity"),
                     "Flags": quote["flags"],
                 }
             )
         ev_table = pd.DataFrame(table_rows)
+        ev_table["Liquidity"] = pd.to_numeric(
+            ev_table["Liquidity"], errors="coerce"
+        )
+        max_ev_for_progress = max(20.0, float(ev_table["EV %"].max()))
         st.dataframe(
             ev_table,
+            column_config={
+                "Sport": st.column_config.TextColumn("Sport", width="small"),
+                "Matchup": st.column_config.TextColumn(
+                    "Matchup", width="medium", pinned=True
+                ),
+                "Start (ET)": st.column_config.TextColumn(
+                    "Start (ET)", width="medium"
+                ),
+                "Market": st.column_config.TextColumn("Market", width="medium"),
+                "Selection": st.column_config.TextColumn("Selection"),
+                "Book / venue": st.column_config.TextColumn("Book / venue"),
+                "American": st.column_config.NumberColumn(
+                    "American", format="%+d", width="small"
+                ),
+                "Decimal": st.column_config.NumberColumn(
+                    "Decimal", format="%.2f", width="small"
+                ),
+                "EV %": st.column_config.ProgressColumn(
+                    "EV %",
+                    format="%.2f%%",
+                    min_value=0.0,
+                    max_value=max_ev_for_progress,
+                    color="green",
+                    help="Estimated expected value as a percentage of stake.",
+                ),
+                "Kelly stake": st.column_config.NumberColumn(
+                    "Kelly stake", format="$%.2f"
+                ),
+                "Liquidity": st.column_config.NumberColumn(
+                    "Liquidity",
+                    format="$%.2f",
+                    help="Liquidity reported by the venue, when available.",
+                ),
+                "Flags": st.column_config.TextColumn("Flags", width="small"),
+            },
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
+            alt="Positive expected value opportunities with odds and suggested stake",
         )
         st.download_button(
             "Download +EV opportunities (CSV)",
@@ -616,7 +697,10 @@ with tab_tracker:
                         f"CLV · mean {closed_clv.mean():+.2f}%"
                     )
                 st.dataframe(
-                    method_log, hide_index=True, use_container_width=True
+                    method_log,
+                    hide_index=True,
+                    width="stretch",
+                    alt=f"{method_label} positive EV and closing line history",
                 )
             st.download_button(
                 "Download +EV history and CLV (CSV)",
@@ -690,7 +774,11 @@ with tab_tracker:
         metric_columns[3].metric(
             "Average logged EV", f"{bets_df['expected_ev_pct'].mean():.2f}%"
         )
-        st.dataframe(bets_df, use_container_width=True)
+        st.dataframe(
+            bets_df,
+            width="stretch",
+            alt="Manually tracked bets and their results",
+        )
 
         pending = bets_df[bets_df["status"] == "Pending"]
         if not pending.empty:
@@ -742,6 +830,6 @@ with tab_guide:
 | **Closing-line value (CLV)** | Compares the logged book price with the latest stored Pinnacle fair probability before kickoff: `book decimal odds x closing fair probability - 1`. A scan near kickoff improves this estimate; it is not an official close unless the feed provides one. |
 | **ROI** | Net profit divided by total amount staked. Results can vary widely over small samples. |
 
-PropLine coverage and accepted prices vary. Verify that every wager is available at the quoted price and that fees, market period, and settlement rules match across venues. EV and arbitrage estimates do not subtract prediction-market fees or order-book spreads.
+PropLine coverage and accepted prices vary. Verify that every wager is available at the quoted price and that fees, market period, and settlement rules match across venues. EV and arbitrage estimates do not subtract exchange fees or order-book spreads.
 """
     )

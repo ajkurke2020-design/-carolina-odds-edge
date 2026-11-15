@@ -86,9 +86,6 @@ APPROVED_BOOKMAKERS = {
     "fanatics": "Fanatics",
     "thescorebet": "theScore Bet",
     "underdog": "Underdog",
-    "polymarket": "Polymarket",
-    "polymarket_us": "Polymarket US",
-    "kalshi": "Kalshi",
     "novig": "Novig",
     "prophetx": "ProphetX",
 }

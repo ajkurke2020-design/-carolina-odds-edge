@@ -7,6 +7,7 @@ class ScannerConfig:
     pinnacle_bookmaker_name: str = "Pinnacle"
     devig_method: str = "power"
     min_ev_pct: float = 2.0
+    min_liquidity_dollars: float = 0.0
     verify_ev_pct: float = 15.0
     max_quote_age_seconds: int = 60
     max_pinnacle_overround: float = 1.06

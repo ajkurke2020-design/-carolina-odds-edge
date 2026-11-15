@@ -42,6 +42,8 @@ def _ensure_columns(
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bets (
