@@ -172,10 +172,30 @@ def init_db():
         )
 
 
-def log_bet(bet_data: dict):
+def log_bets(bets_data: list[dict]) -> None:
+    if not bets_data:
+        raise ValueError("At least one bet is required.")
     init_db()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        (
+            timestamp,
+            bet_data.get("mode"),
+            bet_data.get("sport"),
+            bet_data.get("matchup"),
+            bet_data.get("market"),
+            bet_data.get("selection"),
+            bet_data.get("sportsbook"),
+            bet_data.get("odds_american"),
+            bet_data.get("odds_decimal"),
+            bet_data.get("fair_prob_at_bet"),
+            bet_data.get("expected_ev_pct"),
+            bet_data.get("stake"),
+        )
+        for bet_data in bets_data
+    ]
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute(
+        conn.executemany(
             """
             INSERT INTO bets (
                 timestamp, mode, sport, matchup, market, selection, sportsbook,
@@ -183,21 +203,12 @@ def log_bet(bet_data: dict):
                 stake, status, profit_loss
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 0.0)
             """,
-            (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                bet_data.get("mode"),
-                bet_data.get("sport"),
-                bet_data.get("matchup"),
-                bet_data.get("market"),
-                bet_data.get("selection"),
-                bet_data.get("sportsbook"),
-                bet_data.get("odds_american"),
-                bet_data.get("odds_decimal"),
-                bet_data.get("fair_prob_at_bet"),
-                bet_data.get("expected_ev_pct"),
-                bet_data.get("stake"),
-            ),
+            rows,
         )
+
+
+def log_bet(bet_data: dict) -> None:
+    log_bets([bet_data])
 
 
 def load_bets() -> pd.DataFrame:
@@ -206,7 +217,13 @@ def load_bets() -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM bets", conn)
 
 
-def update_bet_result(bet_id: int, status: str, closing_odds: float, profit_loss: float, clv_pct: float):
+def update_bet_result(
+    bet_id: int,
+    status: str,
+    closing_odds: float | None,
+    profit_loss: float,
+    clv_pct: float | None,
+) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """

@@ -12,11 +12,16 @@ from database import (
     load_bets,
     load_opportunity_log,
     log_bet,
+    log_bets,
     log_scan,
     update_bet_result,
 )
-from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
+from ev_engine import (
+    calculate_capped_kelly_stakes,
+    decimal_to_american,
+)
 from scanner_logic import (
+    expected_value_with_push_pct,
     expected_value_pct,
     deduplicate_alt_line_ladders,
     filter_quotes,
@@ -25,6 +30,25 @@ from scanner_logic import (
 )
 from propline_api import APPROVED_BOOKMAKERS, EASTERN, SPORT_CONFIG, run_api
 from scanner_config import CONFIG
+
+
+def _request_ev_bet_log() -> None:
+    click = st.session_state.get("ev_log_action")
+    if click is None:
+        return
+    row_index = click.row
+    opportunities = st.session_state.get("ev_log_rows", [])
+    if not isinstance(row_index, int) or not 0 <= row_index < len(opportunities):
+        st.session_state["bet_log_error"] = (
+            "Could not identify that +EV row. Refresh the board and try again."
+        )
+        return
+    st.session_state["pending_bet_log"] = {
+        "kind": "ev",
+        "request_id": uuid4().hex,
+        "opportunity": opportunities[row_index]["opportunity"],
+        "recommended_stake": opportunities[row_index]["recommended_stake"],
+    }
 
 
 def _configured_secret(name: str) -> str:
@@ -72,6 +96,173 @@ st.set_page_config(page_title="NC Odds Edge", layout="wide")
 _require_app_access()
 init_db()
 finalize_started_opportunities()
+
+
+@st.dialog("Confirm placed bet", width="medium", dismissible=False)
+def _show_bet_log_dialog(pending_bet_log: dict) -> None:
+    request_id = pending_bet_log["request_id"]
+    opportunity = pending_bet_log["opportunity"]
+    kind = pending_bet_log["kind"]
+
+    def close_dialog() -> None:
+        st.session_state.pop("pending_bet_log", None)
+        st.rerun()
+
+    def save_bets(bets: list[dict], confirmation: str) -> None:
+        log_bets(bets)
+        st.session_state["bet_log_notice"] = confirmation
+        st.session_state.pop("pending_bet_log", None)
+        st.rerun()
+
+    if kind == "ev":
+        market = f"{opportunity['market']} · {opportunity['period']}".strip(" ·")
+        st.write(
+            f"{opportunity['matchup']} · {opportunity['sport']} · "
+            f"{market} · {opportunity['selection']} at {opportunity['sportsbook']}"
+        )
+        st.caption(
+            "Confirm the decimal odds and amount you actually placed. "
+            "The displayed price and Kelly stake are starting values only."
+        )
+        with st.form(f"confirm_ev_bet_{request_id}"):
+            actual_odds = st.number_input(
+                "Actual decimal odds",
+                min_value=1.01,
+                max_value=1000.0,
+                value=max(1.01, float(opportunity["odds_decimal"])),
+                step=0.01,
+                key=f"ev_actual_odds_{request_id}",
+            )
+            actual_stake = st.number_input(
+                "Actual amount staked ($)",
+                min_value=0.01,
+                value=max(0.01, float(pending_bet_log["recommended_stake"])),
+                step=1.0,
+                key=f"ev_actual_stake_{request_id}",
+            )
+            save_clicked = st.form_submit_button("Log placed bet", type="primary")
+            cancel_clicked = st.form_submit_button("Cancel")
+        if cancel_clicked:
+            close_dialog()
+        if save_clicked:
+            if actual_odds <= 1 or actual_stake <= 0:
+                st.error("Enter odds greater than 1.00 and a stake greater than $0.")
+            else:
+                push_probability = float(opportunity.get("push_probability") or 0.0)
+                if push_probability > 0:
+                    actual_ev = expected_value_with_push_pct(
+                        actual_odds,
+                        float(opportunity["win_probability"]),
+                        float(opportunity["lose_probability"]),
+                    )
+                else:
+                    actual_ev = expected_value_pct(
+                        actual_odds, float(opportunity["fair_probability"])
+                    )
+                save_bets(
+                    [
+                        {
+                            "mode": (
+                                "Line-adjusted +EV"
+                                if opportunity.get("pricing_method") == "line-adjusted"
+                                else "+EV"
+                            ),
+                            "sport": opportunity["sport"],
+                            "matchup": opportunity["matchup"],
+                            "market": market,
+                            "selection": opportunity["selection"],
+                            "sportsbook": opportunity["sportsbook"],
+                            "odds_american": decimal_to_american(actual_odds),
+                            "odds_decimal": actual_odds,
+                            "fair_prob_at_bet": opportunity["fair_probability"],
+                            "expected_ev_pct": actual_ev,
+                            "stake": actual_stake,
+                        }
+                    ],
+                    "Logged your placed +EV bet with the actual odds and stake.",
+                )
+        return
+
+    if kind != "arbitrage":
+        st.error("This bet logging request is invalid.")
+        if st.button("Close", key=f"close_invalid_bet_log_{request_id}"):
+            close_dialog()
+        return
+
+    st.write(
+        f"{opportunity['matchup']} · {opportunity['sport']} · "
+        f"{opportunity['market']} · {opportunity['period'] or 'Full market'}"
+    )
+    st.warning(
+        "Only keep legs you actually placed. If one leg was rejected or not placed, "
+        "uncheck it; the remaining leg will be tracked as a partial arbitrage."
+    )
+    with st.form(f"confirm_arbitrage_{request_id}"):
+        placed_legs = []
+        for index, leg in enumerate(opportunity["legs"]):
+            st.markdown(f"**{leg['selection']} at {leg['sportsbook']}**")
+            include_leg = st.checkbox(
+                "I placed this leg",
+                value=True,
+                key=f"arb_leg_placed_{request_id}_{index}",
+            )
+            odds_column, stake_column = st.columns(2)
+            actual_odds = odds_column.number_input(
+                "Actual decimal odds",
+                min_value=1.01,
+                max_value=1000.0,
+                value=max(1.01, float(leg["odds_decimal"])),
+                step=0.01,
+                key=f"arb_actual_odds_{request_id}_{index}",
+            )
+            actual_stake = stake_column.number_input(
+                "Actual amount staked ($)",
+                min_value=0.01,
+                value=max(0.01, float(leg["stake"])),
+                step=1.0,
+                key=f"arb_actual_stake_{request_id}_{index}",
+            )
+            if include_leg:
+                placed_legs.append((leg, actual_odds, actual_stake))
+        save_clicked = st.form_submit_button("Log selected legs", type="primary")
+        cancel_clicked = st.form_submit_button("Cancel")
+    if cancel_clicked:
+        close_dialog()
+    if save_clicked:
+        if not placed_legs:
+            st.error("Select at least one leg that you actually placed.")
+            return
+        mode = (
+            "Arbitrage"
+            if len(placed_legs) == len(opportunity["legs"])
+            else "Arbitrage (partial)"
+        )
+        bets = []
+        for leg, actual_odds, actual_stake in placed_legs:
+            if actual_odds <= 1 or actual_stake <= 0:
+                st.error("Enter odds greater than 1.00 and a stake greater than $0.")
+                return
+            bets.append(
+                {
+                    "mode": mode,
+                    "sport": opportunity["sport"],
+                    "matchup": opportunity["matchup"],
+                    "market": f"{leg['market']} · {opportunity['period']}".strip(" ·"),
+                    "selection": leg["selection"],
+                    "sportsbook": leg["sportsbook"],
+                    "odds_american": decimal_to_american(actual_odds),
+                    "odds_decimal": actual_odds,
+                    "fair_prob_at_bet": None,
+                    "expected_ev_pct": None,
+                    "stake": actual_stake,
+                }
+            )
+        save_bets(
+            bets,
+            f"Logged {len(bets)} arbitrage leg{'s' if len(bets) != 1 else ''} "
+            "with the actual odds and stakes.",
+        )
+
 
 SPORTS = list(SPORT_CONFIG)
 DEFAULT_BOOKS = list(APPROVED_BOOKMAKERS.values())
@@ -252,6 +443,11 @@ with header:
 with scan_action:
     st.markdown('<span class="edge-pill">PROPLINE API</span>', unsafe_allow_html=True)
     scan_button = st.button("Scan odds", type="primary", width="stretch")
+
+if bet_log_notice := st.session_state.pop("bet_log_notice", None):
+    st.success(bet_log_notice)
+if bet_log_error := st.session_state.pop("bet_log_error", None):
+    st.error(bet_log_error)
 
 server_api_key = _configured_secret("PROPLINE_API_KEY")
 if server_api_key:
@@ -514,7 +710,14 @@ with tab_ev:
         )
     else:
         table_rows = []
+        st.session_state["ev_log_rows"] = []
         for quote, recommended_stake in zip(ev_opportunities, kelly_stakes):
+            st.session_state["ev_log_rows"].append(
+                {
+                    "opportunity": quote,
+                    "recommended_stake": float(recommended_stake),
+                }
+            )
             table_rows.append(
                 {
                     "Sport": quote["sport"],
@@ -529,6 +732,7 @@ with tab_ev:
                     "Kelly stake": float(recommended_stake),
                     "Liquidity": quote.get("liquidity"),
                     "Flags": quote["flags"],
+                    "Log": "Log",
                 }
             )
         ev_table = pd.DataFrame(table_rows)
@@ -572,14 +776,22 @@ with tab_ev:
                     help="Liquidity reported by the venue, when available.",
                 ),
                 "Flags": st.column_config.TextColumn("Flags", width="small"),
+                "Log": st.column_config.ButtonColumn(
+                    "Log",
+                    help="Confirm actual odds and stake for a bet you placed.",
+                    type="primary",
+                    on_click=_request_ev_bet_log,
+                    key="ev_log_action",
+                    width="small",
+                ),
             },
             hide_index=True,
             width="stretch",
-            alt="Positive expected value opportunities with odds and suggested stake",
+            alt="Positive expected value opportunities with odds, suggested stake, and a log action",
         )
         st.download_button(
             "Download +EV opportunities (CSV)",
-            data=ev_table.to_csv(index=False).encode("utf-8"),
+            data=ev_table.drop(columns=["Log"]).to_csv(index=False).encode("utf-8"),
             file_name="pinnacle_anchored_ev.csv",
             mime="text/csv",
         )
@@ -607,7 +819,7 @@ with tab_arb:
             "No arbitrage survives the current venues and stake-rounding increment. "
             "Try a smaller rounding increment to check whether a theoretical edge remains profitable."
         )
-    for opportunity in arbitrage_opportunities:
+    for opportunity_index, opportunity in enumerate(arbitrage_opportunities):
         with st.container(border=True):
             event_column, profit_column = st.columns([3, 1])
             event_column.markdown(
@@ -651,6 +863,17 @@ with tab_arb:
                     f"Gross before fees: "
                     f"${leg['payout'] - opportunity['total_stake']:+.2f}"
                 )
+            if st.button(
+                "Log placed arbitrage",
+                key=f"log_arbitrage_{opportunity_index}",
+                help="Confirm which legs you placed and enter the actual odds and stakes.",
+            ):
+                st.session_state["pending_bet_log"] = {
+                    "kind": "arbitrage",
+                    "request_id": uuid4().hex,
+                    "opportunity": opportunity,
+                }
+                st.rerun()
     if all_quotes:
         st.caption(
             "Each card tells you the stake for each outcome and the return if it wins. "
@@ -664,6 +887,10 @@ with tab_arb:
 
 with tab_tracker:
     st.subheader("Bet history and closing-line value")
+    st.caption(
+        "Use the Log action on a +EV row or arbitrage card to record a placed wager. "
+        "Manual entry is for bets not shown on those boards."
+    )
     opportunity_log = load_opportunity_log()
     with st.expander("Scanned +EV history and CLV", expanded=False):
         st.caption(
@@ -708,7 +935,7 @@ with tab_tracker:
                 file_name="pinnacle_ev_clv_history.csv",
                 mime="text/csv",
             )
-    with st.expander("Log a real bet manually"):
+    with st.expander("Log a bet not shown on the boards"):
         with st.form("manual_bet_form"):
             manual_sport = st.selectbox("Sport", SPORTS)
             manual_matchup = st.text_input("Matchup")
@@ -771,13 +998,18 @@ with tab_tracker:
         metric_columns[0].metric("Bets logged", len(bets_df))
         metric_columns[1].metric("Net profit", f"${net_profit:.2f}")
         metric_columns[2].metric("ROI", f"{roi:.2f}%")
+        ev_results = bets_df.loc[
+            ~bets_df["mode"].fillna("").str.startswith("Arbitrage"),
+            "expected_ev_pct",
+        ].dropna()
         metric_columns[3].metric(
-            "Average logged EV", f"{bets_df['expected_ev_pct'].mean():.2f}%"
+            "Average logged EV",
+            f"{ev_results.mean():.2f}%" if not ev_results.empty else "N/A",
         )
         st.dataframe(
             bets_df,
             width="stretch",
-            alt="Manually tracked bets and their results",
+            alt="Manually tracked bets, logged opportunities, and their results",
         )
 
         pending = bets_df[bets_df["status"] == "Pending"]
@@ -785,18 +1017,27 @@ with tab_tracker:
             st.markdown("#### Grade a pending bet")
             bet_id = st.selectbox("Bet ID", pending["id"].tolist())
             result = st.selectbox("Result", ["Won", "Lost", "Push"])
-            closing_odds = st.number_input(
-                "Closing decimal odds", min_value=1.01, value=2.0, step=0.01
-            )
+            bet = pending[pending["id"] == bet_id].iloc[0]
+            is_arbitrage_bet = str(bet["mode"]).startswith("Arbitrage")
+            if is_arbitrage_bet:
+                st.caption("Closing-line value is not calculated for arbitrage legs.")
+                closing_odds = None
+            else:
+                closing_odds = st.number_input(
+                    "Closing decimal odds", min_value=1.01, value=2.0, step=0.01
+                )
             if st.button("Save result"):
-                bet = pending[pending["id"] == bet_id].iloc[0]
                 if result == "Won":
                     profit_loss = bet["stake"] * (bet["odds_decimal"] - 1)
                 elif result == "Lost":
                     profit_loss = -bet["stake"]
                 else:
                     profit_loss = 0.0
-                clv_pct = ((1 / closing_odds * bet["odds_decimal"]) - 1) * 100
+                clv_pct = (
+                    None
+                    if closing_odds is None
+                    else ((1 / closing_odds * bet["odds_decimal"]) - 1) * 100
+                )
                 update_bet_result(
                     int(bet_id), result, closing_odds, profit_loss, clv_pct
                 )
@@ -820,12 +1061,13 @@ with tab_guide:
 | **Decimal odds** | Total return per $1 staked, including the original stake. `2.50` returns $2.50 on a $1 win. |
 | **Implied probability** | The break-even win chance suggested by odds before accounting for venue margin or fees: `1 / decimal odds`. |
 | **Fair probability** | An estimate of an outcome's chance. This app uses only a matching two-sided Pinnacle quote, removes its vig with the configurable power method by default, and applies that probability to other approved venues quoting the exact same event, period, market, team scope, line, and selection. Pinnacle is a reference, never a bettable row. It remains an estimate, not a guarantee. |
-| **Vig (overround)** | The margin reflected by odds. Add each outcome's implied probability; a total above 100% is the overround. Prediction-market fees and bid/ask spreads are separate and are not deducted from EV. |
+| **Vig (overround)** | The margin reflected by odds. Add each outcome's implied probability; a total above 100% is the overround. Exchange fees and bid/ask spreads are separate and are not deducted from EV. |
 | **Pinnacle overround** | The sum of Pinnacle's two implied probabilities before de-vigging. Markets above the configured limit are excluded. |
 | **Expected value (EV)** | Average theoretical profit or loss over many similar bets: `EV ($) = [P(win) x (decimal odds - 1) - P(loss)] x stake`. EV% is EV divided by stake; EV / $100 shows the expected dollars on a $100 wager. Equivalently, `EV% = (decimal odds x fair probability - 1) x 100`. Positive EV does not mean this bet will win. |
 | **Kelly criterion** | A formula for how much of a bankroll to wager based on your estimated win chance and payout. In simple terms, a bigger edge suggests a larger stake, but Kelly is sensitive to probability errors. |
 | **Kelly fraction** | The share of the full Kelly suggestion to use. `0.25` is quarter-Kelly. Suggestions are capped at 1% of bankroll per bet and 3% per event, then rounded down to cents; these safeguards do not remove risk. |
 | **Arbitrage** | For a two-outcome market, take the opposite sides at two different venues when `1 / odds1 + 1 / odds2 < 1`. The app shows the stake and return for each side, plus the minimum profit after rounding. Odds movement, limits, rejection, fees, and differing settlement rules still create execution risk. |
+| **Log placed bet** | A +EV log saves the actual decimal odds and stake you confirm; it does not place the bet. An arbitrage log saves each selected leg separately. Uncheck any leg you did not place, then grade every logged leg after the event. |
 | **Verify flag** | A Pinnacle-referenced edge above 15%. It is shown but flagged because stale, mismatched, or unusual odds are more likely at very large EV values. |
 | **Closing-line value (CLV)** | Compares the logged book price with the latest stored Pinnacle fair probability before kickoff: `book decimal odds x closing fair probability - 1`. A scan near kickoff improves this estimate; it is not an official close unless the feed provides one. |
 | **ROI** | Net profit divided by total amount staked. Results can vary widely over small samples. |
@@ -833,3 +1075,6 @@ with tab_guide:
 PropLine coverage and accepted prices vary. Verify that every wager is available at the quoted price and that fees, market period, and settlement rules match across venues. EV and arbitrage estimates do not subtract exchange fees or order-book spreads.
 """
     )
+
+if pending_bet_log := st.session_state.get("pending_bet_log"):
+    _show_bet_log_dialog(pending_bet_log)

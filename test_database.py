@@ -6,6 +6,8 @@ from contextlib import closing
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pandas as pd
+
 import database
 
 
@@ -105,6 +107,50 @@ class OpportunityLogTests(unittest.TestCase):
                 ("PRAGMA busy_timeout=5000;", 5000),
             ],
         )
+
+    def test_log_bets_saves_arbitrage_legs_and_grades_without_clv(self):
+        database.log_bets(
+            [
+                {
+                    "mode": "Arbitrage",
+                    "sport": "NBA",
+                    "matchup": "Home vs Away",
+                    "market": "Moneyline",
+                    "selection": "Home",
+                    "sportsbook": "DraftKings",
+                    "odds_american": 110,
+                    "odds_decimal": 2.1,
+                    "fair_prob_at_bet": None,
+                    "expected_ev_pct": None,
+                    "stake": 52.0,
+                },
+                {
+                    "mode": "Arbitrage",
+                    "sport": "NBA",
+                    "matchup": "Home vs Away",
+                    "market": "Moneyline",
+                    "selection": "Away",
+                    "sportsbook": "FanDuel",
+                    "odds_american": 105,
+                    "odds_decimal": 2.05,
+                    "fair_prob_at_bet": None,
+                    "expected_ev_pct": None,
+                    "stake": 48.0,
+                },
+            ]
+        )
+
+        bets = database.load_bets().sort_values("id").reset_index(drop=True)
+        self.assertEqual(len(bets), 2)
+        self.assertTrue((bets["status"] == "Pending").all())
+        self.assertTrue(bets["expected_ev_pct"].isna().all())
+        self.assertEqual(bets["selection"].tolist(), ["Home", "Away"])
+
+        database.update_bet_result(int(bets.loc[0, "id"]), "Won", None, 57.2, None)
+        graded_bet = database.load_bets().set_index("id").loc[bets.loc[0, "id"]]
+        self.assertEqual(graded_bet["status"], "Won")
+        self.assertTrue(pd.isna(graded_bet["closing_odds_decimal"]))
+        self.assertTrue(pd.isna(graded_bet["clv_pct"]))
 
     def test_line_adjusted_clv_uses_closing_pinnacle_lines_at_venue_line(self):
         opportunity = {

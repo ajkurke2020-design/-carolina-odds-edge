@@ -1,8 +1,8 @@
 # NC Odds Edge
 
 A local dashboard for comparing betting-venue prices, estimating positive
-expected value, finding cross-venue arbitrage, and tracking manually placed
-bets. Its compact dark board takes general UI inspiration from odds-screen
+expected value, finding cross-venue arbitrage, and tracking placed bets. Its
+compact dark board takes general UI inspiration from odds-screen
 products; it does not use OddsJam branding or assets and is not affiliated
 with OddsJam.
 
@@ -128,6 +128,13 @@ when you want a refreshed snapshot; responses are not polled in the background.
   in separate CLV buckets; adjusted rows estimate the close at the venue's
   line from same-scan Pinnacle snapshots. This is an observed close estimate,
   not an official closing line; scan near kickoff for more useful CLV data.
+- To track a wager you actually placed, use **Log** beside a +EV row or
+  **Log placed arbitrage** on an arbitrage card, then confirm the actual odds
+  and stake. Arbitrage legs are saved as separate tracker rows in one
+  transaction; uncheck any leg you did not place. Grade each placed leg after
+  the event to update net profit and ROI. These actions record bets only; they
+  do not place wagers. Manual entry remains available for bets not shown by a
+  scan.
 
 The app cannot ensure a quote is still available or that every leg is accepted.
 Arbitrage calculations exclude limits, rejected wagers, price movement, fees,
