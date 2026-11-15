@@ -700,7 +700,7 @@ with tab_tracker:
                     method_log,
                     hide_index=True,
                     width="stretch",
-                    alt=f"{method_label} positive EV and closing line history",
+                    alt=f"{title} positive EV and closing line history",
                 )
             st.download_button(
                 "Download +EV history and CLV (CSV)",
