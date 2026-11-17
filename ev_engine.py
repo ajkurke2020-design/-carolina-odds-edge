@@ -2,6 +2,7 @@ from math import floor, isfinite
 from typing import Any
 
 from scanner_config import CONFIG
+from scanner_logic import devig_two_way
 
 
 def decimal_to_american(decimal: float) -> int:
@@ -38,12 +39,29 @@ def calculate_kelly(
     return round(recommended, 2)
 
 
+def _has_flag(flags: Any, name: str) -> bool:
+    return name in {part.strip() for part in str(flags or "").split(",")}
+
+
+def _reported_liquidity(quote: dict[str, Any]) -> float | None:
+    liquidity = quote.get("liquidity")
+    if liquidity is None or isinstance(liquidity, bool):
+        return None
+    try:
+        value = float(liquidity)
+    except (TypeError, ValueError):
+        return None
+    return value if isfinite(value) else None
+
+
 def calculate_capped_kelly_stakes(
     opportunities: list[dict[str, Any]],
     bankroll: float,
     fraction: float,
     per_bet_cap_fraction: float = CONFIG.max_bet_pct,
     per_event_cap_fraction: float = CONFIG.max_event_pct,
+    verify_stake_multiplier: float = CONFIG.verify_stake_multiplier,
+    liquidity_stake_fraction: float = CONFIG.liquidity_stake_fraction,
 ) -> list[float]:
     if not isfinite(bankroll) or bankroll < 0:
         raise ValueError("Bankroll must be a nonnegative finite amount.")
@@ -56,18 +74,26 @@ def calculate_capped_kelly_stakes(
         or not 0 <= per_event_cap_fraction <= 1
     ):
         raise ValueError("Stake caps must be between 0 and 1.")
+    if not isfinite(verify_stake_multiplier) or not 0 <= verify_stake_multiplier <= 1:
+        raise ValueError("Verify stake multiplier must be between 0 and 1.")
+    if not isfinite(liquidity_stake_fraction) or not 0 <= liquidity_stake_fraction <= 1:
+        raise ValueError("Liquidity stake fraction must be between 0 and 1.")
 
     raw_stakes = []
     events: dict[tuple[str, str], list[int]] = {}
     for index, quote in enumerate(opportunities):
         quote_fraction = quote.get("kelly_fraction", fraction)
+        verify_multiplier = (
+            verify_stake_multiplier if _has_flag(quote.get("flags"), "verify") else 1.0
+        )
         raw_stake = min(
             calculate_kelly(
                 bankroll,
                 quote["fair_probability"],
-                quote["odds_decimal"],
+                quote.get("odds_decimal_net", quote["odds_decimal"]),
                 quote_fraction,
-            ),
+            )
+            * verify_multiplier,
             bankroll * per_bet_cap_fraction,
         )
         raw_stakes.append(raw_stake)
@@ -84,10 +110,26 @@ def calculate_capped_kelly_stakes(
         scale = min(1.0, event_cap / event_total) if event_total else 0.0
         for index in indices:
             capped_stake = raw_stakes[index] * scale
+            liquidity = _reported_liquidity(opportunities[index])
+            if liquidity is not None:
+                capped_stake = min(capped_stake, liquidity * liquidity_stake_fraction)
             recommended[index] = float(
                 floor((capped_stake + 1e-9) * 100) / 100
             )
     return recommended
+
+
+def bet_clv_pct(
+    bet_decimal: float,
+    closing_decimal: float | None,
+    other_closing_decimal: float | None,
+    method: str = CONFIG.devig_method,
+) -> float:
+    """No-vig CLV: book price times the de-vigged closing probability of the bet side."""
+    if closing_decimal is None or other_closing_decimal is None:
+        raise ValueError("Both sides' closing decimal odds are required for CLV.")
+    fair_close, _ = devig_two_way(closing_decimal, other_closing_decimal, method)
+    return (bet_decimal * fair_close - 1) * 100
 
 
 def round_stake(

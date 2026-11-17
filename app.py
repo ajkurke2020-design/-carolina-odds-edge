@@ -1,4 +1,3 @@
-import hmac
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -14,9 +13,11 @@ from database import (
     log_bet,
     log_bets,
     log_scan,
+    summarize_clv_edges,
     update_bet_result,
 )
 from ev_engine import (
+    bet_clv_pct,
     calculate_capped_kelly_stakes,
     decimal_to_american,
 )
@@ -28,6 +29,7 @@ from scanner_logic import (
     find_arbitrage_opportunities,
     scan_pinnacle_ev,
 )
+from app_auth import passphrase_matches
 from propline_api import APPROVED_BOOKMAKERS, EASTERN, SPORT_CONFIG, run_api
 from scanner_config import CONFIG
 
@@ -85,7 +87,7 @@ def _require_app_access() -> None:
         entered_password = st.text_input("Access passphrase", type="password")
         submitted = st.form_submit_button("Unlock")
     if submitted:
-        if hmac.compare_digest(entered_password, access_password):
+        if passphrase_matches(entered_password, access_password):
             st.session_state["app_authenticated"] = True
             st.rerun()
         st.error("Incorrect access passphrase.")
@@ -643,6 +645,10 @@ if diagnostics:
                 f"max {distribution['max']:.2f}%"
             )
         diag_columns[3].metric("EV distribution", ev_distribution)
+        st.caption(
+            f"Untimestamped quotes used in kept +EV rows: "
+            f"{diagnostics.get('untimestamped_quotes_used', 0)}"
+        )
         dropped_labels = {
             "no_pinnacle_reference": "No Pinnacle reference",
             "one_sided_pinnacle_market": "One-sided Pinnacle market",
@@ -657,6 +663,7 @@ if diagnostics:
             "below_min_ev": "Below minimum EV",
             "below_min_liquidity": "Below minimum liquidity",
             "alt_line_duplicate": "Lower-EV alternate-line duplicate",
+            "ambiguous_pinnacle_quote": "Ambiguous Pinnacle quote (conflicting prices)",
         }
         dropped = diagnostics["dropped"]
         st.dataframe(
@@ -696,6 +703,10 @@ with tab_ev:
         f"{CONFIG.min_ev_pct:.1f}% minimum are excluded; edges over "
         f"{CONFIG.verify_ev_pct:.0f}% are flagged for verification rather than hidden. "
         "Kelly stakes are quarter-Kelly by default, capped per bet and per event. "
+        f"Rows flagged for verification show a "
+        f"{'$0' if CONFIG.verify_stake_multiplier == 0 else 'reduced'} suggested stake "
+        "(they stay visible and can still be logged manually), and each suggested stake is "
+        f"capped at {CONFIG.liquidity_stake_fraction:.0%} of reported quote liquidity. "
         "Use the quick filters above to narrow matchups and raise the minimum EV.</p>",
         unsafe_allow_html=True,
     )
@@ -913,15 +924,18 @@ with tab_tracker:
                 if method_log.empty:
                     st.caption("No rows in this CLV bucket yet.")
                     continue
-                closed_clv = method_log["clv_pct"].dropna()
-                if closed_clv.empty:
+                summary = summarize_clv_edges(method_log)
+                if summary["closed"] == 0:
                     st.caption(
-                        f"{len(method_log)} logged; no closing Pinnacle reference recorded yet."
+                        f"{summary['logged']} unique edges logged; no closing Pinnacle "
+                        "reference recorded yet."
                     )
                 else:
                     st.caption(
-                        f"{len(method_log)} logged · {len(closed_clv)} with closing "
-                        f"CLV · mean {closed_clv.mean():+.2f}%"
+                        f"{summary['logged']} unique edges logged · {summary['closed']} "
+                        f"with closing CLV · mean CLV {summary['mean_clv_pct']:+.2f}% · "
+                        f"mean EV {summary['mean_ev_pct']:+.2f}% on the same rows. "
+                        "Repeat scans of one edge are counted once."
                     )
                 st.dataframe(
                     method_log,
@@ -1019,30 +1033,58 @@ with tab_tracker:
             result = st.selectbox("Result", ["Won", "Lost", "Push"])
             bet = pending[pending["id"] == bet_id].iloc[0]
             is_arbitrage_bet = str(bet["mode"]).startswith("Arbitrage")
+            other_closing_odds = None
             if is_arbitrage_bet:
                 st.caption("Closing-line value is not calculated for arbitrage legs.")
                 closing_odds = None
             else:
-                closing_odds = st.number_input(
-                    "Closing decimal odds", min_value=1.01, value=2.0, step=0.01
+                closing_column, other_column = st.columns(2)
+                closing_odds = closing_column.number_input(
+                    "Closing decimal odds (this side)",
+                    min_value=1.01,
+                    value=None,
+                    step=0.01,
+                    placeholder="Required",
+                )
+                other_closing_odds = other_column.number_input(
+                    "Closing decimal odds (other side)",
+                    min_value=1.01,
+                    value=None,
+                    step=0.01,
+                    placeholder="Required",
+                )
+                st.caption(
+                    "CLV uses no-vig closing odds: both sides are required, and the "
+                    "de-vig method is the configured one. Older graded bets used "
+                    "vigged prices and are labeled that way in the bet log."
                 )
             if st.button("Save result"):
-                if result == "Won":
-                    profit_loss = bet["stake"] * (bet["odds_decimal"] - 1)
-                elif result == "Lost":
-                    profit_loss = -bet["stake"]
+                if not is_arbitrage_bet and (
+                    closing_odds is None or other_closing_odds is None
+                ):
+                    st.error("Enter closing decimal odds for both sides before saving.")
                 else:
-                    profit_loss = 0.0
-                clv_pct = (
-                    None
-                    if closing_odds is None
-                    else ((1 / closing_odds * bet["odds_decimal"]) - 1) * 100
-                )
-                update_bet_result(
-                    int(bet_id), result, closing_odds, profit_loss, clv_pct
-                )
-                st.success(f"Saved result for bet #{bet_id}.")
-                st.rerun()
+                    if result == "Won":
+                        profit_loss = bet["stake"] * (bet["odds_decimal"] - 1)
+                    elif result == "Lost":
+                        profit_loss = -bet["stake"]
+                    else:
+                        profit_loss = 0.0
+                    clv_pct = (
+                        None
+                        if is_arbitrage_bet
+                        else bet_clv_pct(
+                            float(bet["odds_decimal"]),
+                            float(closing_odds),
+                            float(other_closing_odds),
+                            CONFIG.devig_method,
+                        )
+                    )
+                    update_bet_result(
+                        int(bet_id), result, closing_odds, profit_loss, clv_pct
+                    )
+                    st.success(f"Saved result for bet #{bet_id}.")
+                    st.rerun()
 
         st.download_button(
             "Download betting history (CSV)",

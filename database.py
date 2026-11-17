@@ -2,7 +2,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -26,6 +26,17 @@ def _utc_iso(value: str | None) -> str | None:
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _closing_window(commence_time: str) -> tuple[str, str]:
+    """Pinnacle snapshots usable as a close: in [kickoff - lag, kickoff]."""
+    kickoff = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+    if kickoff.tzinfo is None:
+        kickoff = kickoff.replace(tzinfo=timezone.utc)
+    earliest = kickoff - timedelta(seconds=CONFIG.max_close_lag_seconds)
+    return earliest.astimezone(timezone.utc).isoformat(), kickoff.astimezone(
+        timezone.utc
+    ).isoformat()
 
 
 def _ensure_columns(
@@ -142,6 +153,11 @@ def init_db():
         )
         _ensure_columns(
             conn,
+            "bets",
+            {"clv_basis": "TEXT NOT NULL DEFAULT 'vigged_price'"},
+        )
+        _ensure_columns(
+            conn,
             "ev_opportunity_log",
             {
                 "pricing_method": "TEXT NOT NULL DEFAULT 'exact'",
@@ -176,7 +192,7 @@ def log_bets(bets_data: list[dict]) -> None:
     if not bets_data:
         raise ValueError("At least one bet is required.")
     init_db()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = _now_utc_iso()
     rows = [
         (
             timestamp,
@@ -200,8 +216,8 @@ def log_bets(bets_data: list[dict]) -> None:
             INSERT INTO bets (
                 timestamp, mode, sport, matchup, market, selection, sportsbook,
                 odds_american, odds_decimal, fair_prob_at_bet, expected_ev_pct,
-                stake, status, profit_loss
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 0.0)
+                stake, status, profit_loss, clv_basis
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 0.0, 'novig')
             """,
             rows,
         )
@@ -228,7 +244,8 @@ def update_bet_result(
         conn.execute(
             """
             UPDATE bets
-            SET status = ?, closing_odds_decimal = ?, profit_loss = ?, clv_pct = ?
+            SET status = ?, closing_odds_decimal = ?, profit_loss = ?, clv_pct = ?,
+                clv_basis = 'novig'
             WHERE id = ?
             """,
             (status, closing_odds, profit_loss, clv_pct, bet_id),
@@ -357,7 +374,8 @@ def finalize_started_opportunities(now: datetime | None = None) -> int:
                 FROM pinnacle_market_snapshots
                 WHERE sport = ? AND event_id = ? AND market_key = ?
                   AND period = ? AND team = ? AND selection = ?
-                  AND quote_time IS NOT NULL AND quote_time <= ?
+                  AND quote_time IS NOT NULL
+                  AND quote_time >= ? AND quote_time <= ?
                 """,
                 (
                     opportunity["sport"],
@@ -366,7 +384,7 @@ def finalize_started_opportunities(now: datetime | None = None) -> int:
                     opportunity["period"],
                     opportunity["team"],
                     opportunity["selection"],
-                    opportunity["commence_time"],
+                    *_closing_window(opportunity["commence_time"]),
                 ),
             ).fetchall()
             closing_probability = None
@@ -512,12 +530,41 @@ def finalize_started_opportunities(now: datetime | None = None) -> int:
         return finalized
 
 
+EDGE_KEY_COLUMNS = [
+    "sport",
+    "event_id",
+    "market",
+    "period",
+    "selection",
+    "sportsbook",
+    "line",
+]
+
+
+def summarize_clv_edges(opportunity_log: pd.DataFrame) -> dict:
+    """Count each edge once (first observation) and summarize its closed rows."""
+    empty = {"logged": 0, "closed": 0, "mean_clv_pct": None, "mean_ev_pct": None}
+    if opportunity_log.empty:
+        return empty
+    deduplicated = opportunity_log.sort_values("observed_at").drop_duplicates(
+        subset=EDGE_KEY_COLUMNS, keep="first"
+    )
+    closed = deduplicated[deduplicated["clv_pct"].notna()]
+    return {
+        "logged": len(deduplicated),
+        "closed": len(closed),
+        "mean_clv_pct": float(closed["clv_pct"].mean()) if not closed.empty else None,
+        "mean_ev_pct": float(closed["ev_pct"].mean()) if not closed.empty else None,
+    }
+
+
 def load_opportunity_log() -> pd.DataFrame:
     init_db()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         return pd.read_sql_query(
             """
-            SELECT observed_at, sport, matchup, market, period, selection,
+            SELECT observed_at, sport, event_id, commence_time, matchup, market,
+                   period, selection,
                    sportsbook, odds_american, odds_decimal, line,
                    pinnacle_line, pinnacle_lines_used, pricing_method,
                    line_adjustment_method, fair_probability, win_probability,

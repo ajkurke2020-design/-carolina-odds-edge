@@ -23,6 +23,24 @@ def _expected_profit_per_dollar(
     )
 
 
+def _validate_book_fees(config=CONFIG) -> None:
+    for _, fee in config.book_fee_pct:
+        if not isfinite(fee) or not 0 <= fee < 1:
+            raise ValueError("Book fee must be a fraction from 0 up to, not including, 1.")
+
+
+def _book_fee_fraction(bookmaker: str, config=CONFIG) -> float:
+    for name, fee in config.book_fee_pct:
+        if name == bookmaker:
+            return float(fee)
+    return 0.0
+
+
+def net_decimal_odds(decimal_odds: float, fee: float) -> float:
+    """Decimal odds after a fee on winnings: 1 + (d - 1) * (1 - fee)."""
+    return 1 + (decimal_odds - 1) * (1 - fee)
+
+
 def expected_value_pct(decimal_odds: float, fair_probability: float) -> float:
     return _expected_profit_per_dollar(decimal_odds, fair_probability) * 100
 
@@ -248,12 +266,15 @@ def _normal_outcome_probabilities(
     )
 
 
-def _standard_deviation_for_sport(sport: str, config=CONFIG) -> float | None:
+def _standard_deviation_for_sport(
+    sport: str, market: str, config=CONFIG
+) -> float | None:
     standard_deviation = next(
         (
             value
-            for name, value in config.line_adjusted_stddev_by_sport
+            for (name, name_market), value in config.line_adjusted_stddev_by_sport
             if name.casefold() == sport.casefold()
+            and name_market == market.casefold()
         ),
         None,
     )
@@ -277,7 +298,7 @@ def estimate_line_adjusted_probability(
     if market not in {"spreads", "totals"} or not isfinite(target_point):
         return None
 
-    standard_deviation = _standard_deviation_for_sport(sport, config)
+    standard_deviation = _standard_deviation_for_sport(sport, market, config)
     usable = []
     for reference in references:
         try:
@@ -336,6 +357,28 @@ def estimate_line_adjusted_probability(
             "push_probability": push,
             "source_references": [exact],
         }
+
+    if _is_whole_line(target_point):
+        by_coordinate = {round(item["coordinate"], 6): item for item in usable}
+        strict = by_coordinate.get(round(target_coordinate - 0.5, 6))
+        loose = by_coordinate.get(round(target_coordinate + 0.5, 6))
+        if (
+            strict is not None
+            and loose is not None
+            and loose["fair_probability"] >= strict["fair_probability"]
+        ):
+            win = strict["fair_probability"]
+            lose = 1 - loose["fair_probability"]
+            push = loose["fair_probability"] - strict["fair_probability"]
+            resolved = win + lose
+            return {
+                "method": "bracket_exact",
+                "fair_probability": win / resolved,
+                "win_probability": win,
+                "lose_probability": lose,
+                "push_probability": push,
+                "source_references": [strict, loose],
+            }
 
     ordered = sorted(usable, key=lambda item: item["coordinate"])
     bracket = None
@@ -449,6 +492,17 @@ def _valid_two_way_market(
     return market == "h2h"
 
 
+def _has_conflicting_prices(candidates: list[dict[str, Any]]) -> bool:
+    """True when quotes sharing a timestamp disagree on price."""
+    prices_by_time: dict[str | None, set[float]] = defaultdict(set)
+    for candidate in candidates:
+        try:
+            prices_by_time[_quote_time_text(candidate)].add(float(candidate["odds_decimal"]))
+        except (KeyError, TypeError, ValueError):
+            return True
+    return any(len(prices) > 1 for prices in prices_by_time.values())
+
+
 def _quote_is_stale(
     quote: dict[str, Any], now: datetime, max_age_seconds: int
 ) -> bool:
@@ -545,6 +599,7 @@ def scan_pinnacle_ev(
     config=CONFIG,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    _validate_book_fees(config)
     now_utc = now or datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
@@ -567,8 +622,10 @@ def scan_pinnacle_ev(
             "below_min_ev": 0,
             "below_min_liquidity": 0,
             "alt_line_duplicate": 0,
+            "ambiguous_pinnacle_quote": 0,
         },
         "rows_kept": 0,
+        "untimestamped_quotes_used": 0,
         "ev_pct": {"min": None, "median": None, "max": None},
     }
 
@@ -600,10 +657,19 @@ def scan_pinnacle_ev(
             quote.get("selection") for quote in market_quotes
         }
         by_selection = {}
+        candidates_by_selection: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for quote in market_quotes:
             selection = quote.get("selection")
             if isinstance(selection, str):
                 by_selection[selection] = quote
+                candidates_by_selection[selection].append(quote)
+        ambiguous_selections = {
+            selection
+            for selection, candidates in candidates_by_selection.items()
+            if _has_conflicting_prices(candidates)
+        }
+        for selection in ambiguous_selections:
+            by_selection.pop(selection, None)
         if len(expected) != 2:
             reference_status[key] = {"status": "invalid_pinnacle_market"}
             continue
@@ -616,7 +682,12 @@ def scan_pinnacle_ev(
             reference_status[key] = {"status": "invalid_pinnacle_market"}
             continue
         if len(by_selection) < 2 or set(by_selection) != expected:
-            reference_status[key] = {"status": "one_sided_pinnacle_market"}
+            status = (
+                "ambiguous_pinnacle_quote"
+                if ambiguous_selections
+                else "one_sided_pinnacle_market"
+            )
+            reference_status[key] = {"status": status}
             continue
         if not _valid_two_way_market(market, by_selection, expected):
             reference_status[key] = {"status": "line_mismatch"}
@@ -841,6 +912,8 @@ def scan_pinnacle_ev(
 
         try:
             decimal_odds = float(quote["odds_decimal"])
+            fee = _book_fee_fraction(str(quote.get("sportsbook") or ""), config)
+            ev_decimal = net_decimal_odds(decimal_odds, fee)
             if line_pricing is None:
                 win_probability = fair_probability
                 lose_probability = 1 - fair_probability
@@ -853,7 +926,7 @@ def scan_pinnacle_ev(
                     and _is_whole_line(exact_point)
                 ):
                     standard_deviation = _standard_deviation_for_sport(
-                        str(quote.get("sport") or ""), config
+                        str(quote.get("sport") or ""), market, config
                     )
                     if standard_deviation is not None:
                         (
@@ -865,17 +938,17 @@ def scan_pinnacle_ev(
                         )
                 ev_pct = (
                     expected_value_with_push_pct(
-                        decimal_odds, win_probability, lose_probability
+                        ev_decimal, win_probability, lose_probability
                     )
                     if push_probability > 0
-                    else expected_value_pct(decimal_odds, fair_probability)
+                    else expected_value_pct(ev_decimal, fair_probability)
                 )
             else:
                 win_probability = line_pricing["win_probability"]
                 lose_probability = line_pricing["lose_probability"]
                 push_probability = line_pricing["push_probability"]
                 ev_pct = expected_value_with_push_pct(
-                    decimal_odds, win_probability, lose_probability
+                    ev_decimal, win_probability, lose_probability
                 )
         except (KeyError, TypeError, ValueError):
             diagnostics["dropped"]["invalid_pinnacle_market"] += 1
@@ -930,6 +1003,7 @@ def scan_pinnacle_ev(
             "pricing_method": (
                 "line-adjusted" if line_pricing is not None else "exact"
             ),
+            "odds_decimal_net": ev_decimal,
             "line_adjustment_method": line_adjustment_method,
             "flags": ", ".join(flags),
             "reference": "Pinnacle",
@@ -943,6 +1017,10 @@ def scan_pinnacle_ev(
     opportunities, duplicate_count = deduplicate_alt_line_ladders(candidate_rows)
     diagnostics["dropped"]["alt_line_duplicate"] = duplicate_count
     diagnostics["rows_kept"] = len(opportunities)
+    diagnostics["untimestamped_quotes_used"] = sum(
+        (row["book_quote_time"] is None) + (row["pinnacle_quote_time"] is None)
+        for row in opportunities
+    )
     if opportunities:
         ev_values = [row["ev_pct"] for row in opportunities]
         diagnostics["ev_pct"] = {
