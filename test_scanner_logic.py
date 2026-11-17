@@ -9,6 +9,7 @@ from scanner_logic import (
     estimate_line_adjusted_probability,
     expected_value_dollars,
     expected_value_pct,
+    _standard_deviation_for_sport,
     find_arbitrage_opportunities,
     scan_pinnacle_ev,
 )
@@ -449,6 +450,7 @@ class PinnacleFairProbabilityTests(unittest.TestCase):
             fraction=0.25,
             per_bet_cap_fraction=1,
             per_event_cap_fraction=1,
+            verify_stake_multiplier=1.0,
         )[0]
         self.assertAlmostEqual(
             stake,
@@ -719,6 +721,174 @@ class ExistingScannerBehaviorTests(unittest.TestCase):
         self.assertLessEqual(sum(stakes[:4]), 30)
         self.assertTrue(all(round(stake, 2) == stake for stake in stakes))
         self.assertEqual(stakes[4], 10.0)
+
+
+class BookFeeTests(unittest.TestCase):
+    def _fee_config(self, dk_fee=0.1, fd_fee=0.0):
+        return replace(CONFIG, book_fee_pct=(("DraftKings", dk_fee), ("FanDuel", fd_fee)))
+
+    def test_default_fees_leave_ev_and_net_odds_unchanged(self):
+        result = scan_pinnacle_ev(two_way_quotes(book_a=2.5), now=NOW)
+        row = next(r for r in result["opportunities"] if r["sportsbook"] == "DraftKings")
+        self.assertAlmostEqual(row["ev_pct"], 25.0)
+        self.assertEqual(row["odds_decimal"], 2.5)
+        self.assertAlmostEqual(row["odds_decimal_net"], 2.5)
+
+    def test_configured_fee_reduces_ev_but_keeps_quoted_odds(self):
+        result = scan_pinnacle_ev(
+            two_way_quotes(book_a=2.5), config=self._fee_config(), now=NOW
+        )
+        row = next(r for r in result["opportunities"] if r["sportsbook"] == "DraftKings")
+        self.assertEqual(row["odds_decimal"], 2.5)
+        self.assertAlmostEqual(row["odds_decimal_net"], 2.35)
+        self.assertAlmostEqual(row["ev_pct"], 17.5)
+
+    def test_fee_applies_only_to_the_named_bookmaker(self):
+        result = scan_pinnacle_ev(
+            two_way_quotes(book_a=2.5, book_b=2.5), config=self._fee_config(), now=NOW
+        )
+        by_book = {r["sportsbook"]: r for r in result["opportunities"]}
+        self.assertAlmostEqual(by_book["DraftKings"]["ev_pct"], 17.5)
+        self.assertAlmostEqual(by_book["FanDuel"]["ev_pct"], 25.0)
+        self.assertAlmostEqual(by_book["FanDuel"]["odds_decimal_net"], 2.5)
+
+    def test_fee_reduces_kelly_stake_through_net_odds(self):
+        plain = scan_pinnacle_ev(two_way_quotes(book_a=2.5), now=NOW)
+        feed = scan_pinnacle_ev(
+            two_way_quotes(book_a=2.5), config=self._fee_config(), now=NOW
+        )
+        plain_row = next(r for r in plain["opportunities"] if r["sportsbook"] == "DraftKings")
+        fee_row = next(r for r in feed["opportunities"] if r["sportsbook"] == "DraftKings")
+        plain_stake, fee_stake = calculate_capped_kelly_stakes(
+            [plain_row, fee_row], bankroll=100000, fraction=0.25,
+            per_bet_cap_fraction=1, per_event_cap_fraction=1,
+            verify_stake_multiplier=1.0,
+        )
+        self.assertGreater(plain_stake, 0)
+        self.assertLess(fee_stake, plain_stake)
+        self.assertAlmostEqual(
+            fee_stake,
+            round(100000 * ((0.5 * 2.35 - 1) / (2.35 - 1)) * 0.25, 2),
+        )
+
+    def test_push_aware_ev_uses_net_odds(self):
+        result = scan_pinnacle_ev(
+            two_way_quotes(market_key="spreads:-3", point_a=-3, point_b=3, book_a=2.2),
+            config=self._fee_config(),
+            now=NOW,
+        )
+        row = next(r for r in result["opportunities"] if r["sportsbook"] == "DraftKings")
+        self.assertGreater(row["push_probability"], 0)
+        self.assertAlmostEqual(
+            row["ev_pct"],
+            (
+                row["win_probability"] * (row["odds_decimal_net"] - 1)
+                - row["lose_probability"]
+            )
+            * 100,
+        )
+        self.assertLess(row["odds_decimal_net"], row["odds_decimal"])
+
+    def test_invalid_fee_fails_loudly_instead_of_dropping_rows(self):
+        for bad_fee in (1.0, -0.1, float("nan")):
+            with self.subTest(fee=bad_fee):
+                with self.assertRaises(ValueError):
+                    scan_pinnacle_ev(
+                        two_way_quotes(book_a=2.5),
+                        config=self._fee_config(dk_fee=bad_fee),
+                        now=NOW,
+                    )
+
+
+class WholeLineBracketAndSdTests(unittest.TestCase):
+    def ref(self, point, probability):
+        return {"point": point, "fair_probability": probability, "overround": 1.0}
+
+    def test_spread_bracket_is_exact_for_home_side(self):
+        refs = [self.ref(-3.5, 0.55), self.ref(-2.5, 0.60)]
+        estimate = estimate_line_adjusted_probability("NBA", "spreads", "Home", -3.0, refs, CONFIG)
+        self.assertEqual(estimate["method"], "bracket_exact")
+        self.assertAlmostEqual(estimate["win_probability"], 0.55)
+        self.assertAlmostEqual(estimate["lose_probability"], 0.40)
+        self.assertAlmostEqual(estimate["push_probability"], 0.05)
+        self.assertAlmostEqual(estimate["fair_probability"], 0.55 / 0.95)
+
+    def test_spread_bracket_is_exact_for_away_side(self):
+        refs = [self.ref(3.5, 0.45), self.ref(2.5, 0.40)]
+        estimate = estimate_line_adjusted_probability("NBA", "spreads", "Away", 3.0, refs, CONFIG)
+        self.assertEqual(estimate["method"], "bracket_exact")
+        self.assertAlmostEqual(estimate["win_probability"], 0.40)
+        self.assertAlmostEqual(estimate["lose_probability"], 0.55)
+        self.assertAlmostEqual(estimate["push_probability"], 0.05)
+
+    def test_total_over_bracket_uses_negated_coordinates(self):
+        refs = [self.ref(220.5, 0.45), self.ref(219.5, 0.55)]
+        estimate = estimate_line_adjusted_probability("NBA", "totals", "Over", 220.0, refs, CONFIG)
+        self.assertEqual(estimate["method"], "bracket_exact")
+        self.assertAlmostEqual(estimate["win_probability"], 0.45)
+        self.assertAlmostEqual(estimate["lose_probability"], 0.45)
+        self.assertAlmostEqual(estimate["push_probability"], 0.10)
+
+    def test_total_under_bracket_uses_direct_coordinates(self):
+        refs = [self.ref(219.5, 0.45), self.ref(220.5, 0.55)]
+        estimate = estimate_line_adjusted_probability("NBA", "totals", "Under", 220.0, refs, CONFIG)
+        self.assertEqual(estimate["method"], "bracket_exact")
+        self.assertAlmostEqual(estimate["win_probability"], 0.45)
+        self.assertAlmostEqual(estimate["push_probability"], 0.10)
+
+    def test_bracket_is_skipped_when_loose_probability_is_lower(self):
+        refs = [self.ref(-3.5, 0.60), self.ref(-2.5, 0.55)]
+        estimate = estimate_line_adjusted_probability("NBA", "spreads", "Home", -3.0, refs, CONFIG)
+        self.assertTrue(estimate is None or estimate["method"] != "bracket_exact")
+
+    def test_standard_deviation_is_keyed_by_sport_and_market(self):
+        self.assertEqual(_standard_deviation_for_sport("NBA", "totals", CONFIG), 15.0)
+        self.assertIsNone(_standard_deviation_for_sport("Tennis", "spreads", CONFIG))
+        self.assertIsNone(_standard_deviation_for_sport("NBA", "moneyline", CONFIG))
+
+    def test_missing_sd_disables_distribution_path_for_that_market(self):
+        config = replace(
+            CONFIG,
+            line_adjusted_stddev_by_sport=(
+                (("NBA", "totals"), 15.0),
+            ),
+        )
+        refs = [self.ref(-2.5, 0.60)]
+        self.assertIsNone(
+            estimate_line_adjusted_probability("NBA", "spreads", "Home", -4.0, refs, config)
+        )
+        self.assertIsNotNone(
+            estimate_line_adjusted_probability("NBA", "totals", "Over", 221.0, [self.ref(220.0, 0.6)], config)
+        )
+
+
+class ReferenceHygieneTests(unittest.TestCase):
+    def test_conflicting_prices_at_same_timestamp_drop_that_pinnacle_selection(self):
+        quotes = two_way_quotes(book_a=2.1, book_b=1.8)
+        duplicate = quote("Pinnacle", "Home", 1.7, expected=["Home", "Away"])
+        duplicate["quote_time"] = None
+        duplicate["last_seen_at"] = FRESH_QUOTE_TIME
+        result = scan_pinnacle_ev(quotes + [duplicate], now=NOW)
+        self.assertEqual(result["opportunities"], [])
+        self.assertEqual(result["diagnostics"]["dropped"]["ambiguous_pinnacle_quote"], 2)
+
+    def test_duplicate_prices_at_different_timestamps_are_not_ambiguous(self):
+        quotes = two_way_quotes(book_a=2.5)
+        earlier = quote("Pinnacle", "Home", 1.7, expected=["Home", "Away"])
+        earlier["last_seen_at"] = "2026-01-01T11:50:00Z"
+        result = scan_pinnacle_ev([earlier] + quotes, now=NOW)
+        self.assertEqual(result["diagnostics"]["dropped"]["ambiguous_pinnacle_quote"], 0)
+        self.assertEqual(len(result["opportunities"]), 1)
+
+    def test_untimestamped_quotes_used_are_counted_in_diagnostics(self):
+        quotes = two_way_quotes(book_a=2.5, book_b=2.5, quote_time=None)
+        result = scan_pinnacle_ev(quotes, now=NOW)
+        self.assertEqual(len(result["opportunities"]), 2)
+        self.assertEqual(result["diagnostics"]["untimestamped_quotes_used"], 4)
+
+    def test_timestamped_quotes_are_not_counted_as_untimestamped(self):
+        result = scan_pinnacle_ev(two_way_quotes(book_a=2.5, book_b=2.5), now=NOW)
+        self.assertEqual(result["diagnostics"]["untimestamped_quotes_used"], 0)
 
 
 if __name__ == "__main__":
