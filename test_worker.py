@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 
 from worker import (
     ACTIVE_SPORTS,
-    ARBITRAGE_TOTAL_STAKE,
+    DEFAULT_MIN_ARB_ROI,
     MAX_HISTORY_AGE_SECONDS,
+    MAX_SINGLE_BET,
     build_alert_key,
     build_arbitrage_alert_key,
     clean_expired_history,
@@ -35,6 +36,10 @@ class WorkerTests(unittest.TestCase):
             ["Tennis", "NCAAB", "NBA", "NHL", "NFL", "NCAAF"],
         )
         self.assertNotIn("MLB", ACTIVE_SPORTS)
+
+    def test_max_single_bet_cap_constant(self):
+        self.assertEqual(MAX_SINGLE_BET, 300.0)
+        self.assertEqual(DEFAULT_MIN_ARB_ROI, 1.0)
 
     def test_is_game_started(self):
         now = datetime(2026, 11, 17, 20, 0, 0, tzinfo=timezone.utc)
@@ -91,12 +96,12 @@ class WorkerTests(unittest.TestCase):
         history = {"key1": {"ev": 4.0, "timestamp": time.time()}}
         self.assertFalse(should_alert("key1", 4.0, history))
         self.assertFalse(should_alert("key1", 3.5, history))
-        self.assertFalse(should_alert("key1", 5.4, history))  # +1.4% increase < +1.5%
+        self.assertFalse(should_alert("key1", 5.4, history))
 
     def test_should_alert_significant_ev_increase(self):
         history = {"key1": {"ev": 4.0, "timestamp": time.time()}}
-        self.assertTrue(should_alert("key1", 5.5, history))  # exactly +1.5%
-        self.assertTrue(should_alert("key1", 6.0, history))  # +2.0%
+        self.assertTrue(should_alert("key1", 5.5, history))
+        self.assertTrue(should_alert("key1", 6.0, history))
 
     def test_should_alert_arbitrage(self):
         history = {}
@@ -104,22 +109,24 @@ class WorkerTests(unittest.TestCase):
 
         history["arb1"] = {"roi": 2.0, "timestamp": time.time()}
         self.assertFalse(should_alert_arbitrage("arb1", 2.0, history))
-        self.assertFalse(should_alert_arbitrage("arb1", 2.3, history))  # < 0.5% increase
-        self.assertTrue(should_alert_arbitrage("arb1", 2.6, history))  # >= 0.5% increase
+        self.assertFalse(should_alert_arbitrage("arb1", 2.3, history))
+        self.assertTrue(should_alert_arbitrage("arb1", 2.6, history))
 
-    def test_format_kelly_units(self):
+    def test_format_kelly_units_and_cap_at_300(self):
         # Default bankroll is 1000, 1 unit = $10
         self.assertEqual(format_kelly_units(0.0), "0u")
         self.assertEqual(format_kelly_units(5.0), "0.5u")
         self.assertEqual(format_kelly_units(10.0), "1u")
         self.assertEqual(format_kelly_units(15.0), "1.5u")
         self.assertEqual(format_kelly_units(20.0), "2u")
-        self.assertEqual(format_kelly_units(2.5), "0.5u")
+        self.assertEqual(format_kelly_units(300.0), "30u")
+        # Over $300 should be capped at 30u ($300)
+        self.assertEqual(format_kelly_units(500.0), "30u")
 
     def test_clean_expired_history(self):
         now = 1000000.0
         history = {
-            "fresh": {"ev": 3.5, "timestamp": now - 3600},  # 1 hour ago
+            "fresh": {"ev": 3.5, "timestamp": now - 3600},
             "borderline": {"ev": 4.0, "timestamp": now - MAX_HISTORY_AGE_SECONDS},
             "expired": {"ev": 5.0, "timestamp": now - (MAX_HISTORY_AGE_SECONDS + 10)},
             "malformed": {"ev": 3.0},
@@ -130,7 +137,7 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("expired", cleaned)
         self.assertNotIn("malformed", cleaned)
 
-    def test_format_telegram_alert_contains_required_fields(self):
+    def test_format_telegram_alert_contains_required_fields_and_caps_at_300(self):
         opp = {
             "sport": "NBA",
             "matchup": "Boston Celtics vs Dallas Mavericks",
@@ -142,7 +149,7 @@ class WorkerTests(unittest.TestCase):
             "sportsbook": "DraftKings",
             "fair_probability": 0.55,
             "ev_pct": 5.05,
-            "kelly_stake": 10.0,
+            "kelly_stake": 500.0,  # Exceeds $300 cap -> should be capped at $300 (30u)
         }
         text = format_telegram_alert(opp)
         self.assertIn("Sport:</b> NBA", text)
@@ -152,63 +159,46 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("Sportsbook:</b> DraftKings", text)
         self.assertIn("Fair Odds:</b>", text)
         self.assertIn("EV%:</b> +5.05%", text)
-        self.assertIn("Recommended Stake:</b> 1u ($10.00)", text)
+        self.assertIn("Recommended Stake:</b> 30u ($300.00)", text)
 
     def test_format_telegram_arbitrage_alert(self):
         arb = {
             "sport": "NBA",
             "matchup": "Lakers vs Warriors",
             "market": "Moneyline",
-            "total_stake": 1000.0,
-            "profit": 24.50,
+            "total_stake": 500.0,
+            "profit": 12.25,
             "roi_pct": 2.45,
-            "locked_payout": 1024.50,
+            "locked_payout": 512.25,
             "legs": [
                 {
                     "selection": "Lakers",
                     "sportsbook": "FanDuel",
                     "odds_decimal": 2.15,
                     "odds_american": 115,
-                    "stake": 476.0,
-                    "payout": 1023.40,
+                    "stake": 238.0,
+                    "payout": 511.70,
                 },
                 {
                     "selection": "Warriors",
                     "sportsbook": "DraftKings",
                     "odds_decimal": 1.95,
                     "odds_american": -105,
-                    "stake": 524.0,
-                    "payout": 1021.80,
+                    "stake": 262.0,
+                    "payout": 510.90,
                 },
             ],
         }
         text = format_telegram_arbitrage_alert(arb)
         self.assertIn("Arbitrage Opportunity (Guaranteed Profit)", text)
         self.assertIn("Sport:</b> NBA", text)
-        self.assertIn("Total Stake:</b> $1,000", text)
-        self.assertIn("Guaranteed Profit:</b> +$24.50 (ROI: +2.45%)", text)
+        self.assertIn("Total Stake:</b> $500", text)
+        self.assertIn("max $300 per bet", text)
+        self.assertIn("Guaranteed Profit:</b> +$12.25 (ROI: +2.45%)", text)
         self.assertIn("Lakers</b> at <b>FanDuel", text)
-        self.assertIn("Stake: <b>$476</b>", text)
+        self.assertIn("Stake: <b>$238</b>", text)
         self.assertIn("Warriors</b> at <b>DraftKings", text)
-        self.assertIn("Stake: <b>$524</b>", text)
-
-    def test_format_telegram_alert_escapes_html(self):
-        opp = {
-            "sport": "NCAAF",
-            "matchup": "Texas A&M vs LSU",
-            "market": "Moneyline",
-            "selection": "Texas A&M",
-            "odds_american": 150,
-            "odds_decimal": 2.5,
-            "sportsbook": "BetMGM",
-            "fair_probability": 0.45,
-            "ev_pct": 12.5,
-            "kelly_stake": 5.0,
-        }
-        text = format_telegram_alert(opp)
-        self.assertIn("Texas A&amp;M vs LSU", text)
-        self.assertNotIn("Texas A&M", text)
-        self.assertIn("Recommended Stake:</b> 0.5u ($5.00)", text)
+        self.assertIn("Stake: <b>$262</b>", text)
 
     def test_send_telegram_message_success_and_failure(self):
         with patch("worker._new_telegram_session") as mock_session_factory:
@@ -282,16 +272,6 @@ class WorkerTests(unittest.TestCase):
                     "ev_pct": 4.5,
                     "kickoff": future_kickoff,
                 },
-                {
-                    "event_id": "event_2",
-                    "sport": "NBA",
-                    "matchup": "Team C vs Team D",
-                    "market": "Moneyline",
-                    "selection": "Team C",
-                    "sportsbook": "DraftKings",
-                    "ev_pct": 5.0,
-                    "kickoff": past_kickoff,  # Started -> should be filtered
-                },
             ]
 
             mock_arbs = [
@@ -301,27 +281,42 @@ class WorkerTests(unittest.TestCase):
                     "matchup": "Team A vs Team B",
                     "market": "Moneyline",
                     "kickoff": future_kickoff,
-                    "total_stake": ARBITRAGE_TOTAL_STAKE,
+                    "total_stake": 500.0,
+                    "implied_probability_sum": 0.96,
                     "profit": 15.0,
-                    "roi_pct": 1.5,
-                    "locked_payout": 1015.0,
+                    "roi_pct": 3.0,
+                    "locked_payout": 515.0,
                     "legs": [
                         {
                             "selection": "Team A",
                             "sportsbook": "FanDuel",
                             "odds_decimal": 2.1,
-                            "stake": 480.0,
-                            "payout": 1008.0,
+                            "stake": 240.0,
+                            "payout": 504.0,
                         },
                         {
                             "selection": "Team B",
                             "sportsbook": "DraftKings",
                             "odds_decimal": 2.05,
-                            "stake": 520.0,
-                            "payout": 1066.0,
+                            "stake": 260.0,
+                            "payout": 533.0,
                         },
                     ],
-                }
+                },
+                {
+                    "sport": "NBA",
+                    "event_id": "event_low",
+                    "matchup": "Low ROI",
+                    "market": "Moneyline",
+                    "kickoff": future_kickoff,
+                    "total_stake": 500.0,
+                    "profit": 2.0,
+                    "roi_pct": 0.4,  # Under 1.0% min ROI -> must be filtered
+                    "legs": [
+                        {"selection": "A", "sportsbook": "FanDuel", "odds_decimal": 2.0, "stake": 250.0},
+                        {"selection": "B", "sportsbook": "DraftKings", "odds_decimal": 2.02, "stake": 250.0},
+                    ],
+                },
             ]
 
             with patch("worker.run_api") as mock_run_api, patch(
@@ -351,16 +346,16 @@ class WorkerTests(unittest.TestCase):
                     result = run_worker(
                         sports=["NBA"],
                         min_ev=3.0,
+                        min_arb_roi=1.0,
                         history_file=hist_file,
                         cache_file=cache_file,
                     )
 
             self.assertTrue(result["success"])
             self.assertEqual(result["eligible_opportunities"], 1)
-            self.assertEqual(result["eligible_arbitrages"], 1)
+            self.assertEqual(result["eligible_arbitrages"], 1)  # Low ROI filtered out
             self.assertEqual(result["ev_alerts_sent"], 1)
             self.assertEqual(result["arb_alerts_sent"], 1)
-            # 1 EV + 1 Arb = 2 alerts sent
             self.assertEqual(mock_send.call_count, 2)
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import socket
 import sys
@@ -28,7 +29,7 @@ from urllib3.util import connection as urllib3_connection
 from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
 from propline_api import SPORT_CONFIG, run_api
 from scanner_config import CONFIG
-from scanner_logic import find_arbitrage_opportunities, scan_pinnacle_ev
+from scanner_logic import _allocate_rounded_stakes, find_arbitrage_opportunities, scan_pinnacle_ev
 
 # Active sports to scan (MLB commented out for the offseason)
 ACTIVE_SPORTS = [
@@ -47,7 +48,11 @@ DEFAULT_MIN_EV_THRESHOLD = 3.0
 DEFAULT_MIN_EV_INCREASE_FOR_RE_ALERT = 1.5
 DEFAULT_MIN_ROI_INCREASE_FOR_ARB = 0.5
 MAX_HISTORY_AGE_SECONDS = 48 * 3600  # 48 hours
-ARBITRAGE_TOTAL_STAKE = 1000.0  # $1,000 stake for arbitrage opportunities
+
+# Risk and Bankroll Limits: Never suggest a single bet over $300
+MAX_SINGLE_BET = 300.0
+DEFAULT_MIN_ARB_ROI = 1.0  # 1.0% minimum ROI for Arbitrage alerts
+ARBITRAGE_TARGET_TOTAL_STAKE = 500.0  # Base stake scaled so no single leg exceeds $300
 
 
 # --- IPv4 Adapter for Telegram API (prevents IPv6 connection resets on Windows/ISPs) ---
@@ -214,18 +219,22 @@ def should_alert_arbitrage(
     return (current_roi - prev_roi) >= min_increase
 
 
-def format_kelly_units(stake: float, bankroll: float = CONFIG.bankroll) -> str:
+def format_kelly_units(
+    stake: float, bankroll: float = CONFIG.bankroll, max_single_bet: float = MAX_SINGLE_BET
+) -> str:
     """
     Format recommended Kelly stake into standard sports betting units (0.5u, 1u, etc.).
-    1 unit is defined as 1% of the bankroll ($10 for a default $1,000 bankroll).
+    Capped at max_single_bet ($300).
+    1 unit is defined as 1% of the bankroll ($10 for default $1,000 bankroll).
     Rounds to the nearest 0.5 unit.
     """
+    effective_stake = min(stake, max_single_bet)
     unit_size = bankroll * 0.01
-    if stake <= 0 or unit_size <= 0:
+    if effective_stake <= 0 or unit_size <= 0:
         return "0u"
-    raw_units = stake / unit_size
+    raw_units = effective_stake / unit_size
     rounded = round(raw_units * 2) / 2
-    if rounded == 0 and stake > 0:
+    if rounded == 0 and effective_stake > 0:
         rounded = 0.5
     if rounded.is_integer():
         return f"{int(rounded)}u"
@@ -299,8 +308,8 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
 
     ev_pct = float(opp.get("ev_pct", 0.0))
 
-    # Recommended Kelly Stake in units and dollars
-    stake = float(opp.get("kelly_stake", 0.0))
+    # Recommended Kelly Stake capped at $300
+    stake = min(float(opp.get("kelly_stake", 0.0)), MAX_SINGLE_BET)
     units_str = format_kelly_units(stake)
     stake_text = f"{units_str} (${stake:.2f})" if stake > 0 else "0u ($0.00)"
 
@@ -320,12 +329,12 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
 def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
     """
     Format Arbitrage opportunity cleanly with HTML showing:
-    Sport, Matchup, Market, Total Stake ($1,000 rounded to $1), Guaranteed Profit, ROI%, and Leg Stakes.
+    Sport, Matchup, Market, Total Stake (scaled with no bet > $300), Guaranteed Profit, ROI%, and Leg Stakes.
     """
     sport = html.escape(str(arb.get("sport") or "Unknown"))
     matchup = html.escape(str(arb.get("matchup") or "Unknown Matchup"))
     market = html.escape(str(arb.get("market") or ""))
-    total_stake = float(arb.get("total_stake", ARBITRAGE_TOTAL_STAKE))
+    total_stake = float(arb.get("total_stake", 0.0))
     profit = float(arb.get("profit", 0.0))
     roi_pct = float(arb.get("roi_pct", 0.0))
     locked_payout = float(arb.get("locked_payout", total_stake + profit))
@@ -365,7 +374,7 @@ def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
         f"🏆 <b>Sport:</b> {sport}\n"
         f"⚔️ <b>Matchup:</b> {matchup}\n"
         f"🎯 <b>Market:</b> {market}\n"
-        f"💰 <b>Total Stake:</b> ${total_stake:,.0f} (nearest $1)\n"
+        f"💰 <b>Total Stake:</b> ${total_stake:,.0f} (max $300 per bet)\n"
         f"💵 <b>Guaranteed Profit:</b> +${profit:.2f} (ROI: +{roi_pct:.2f}%)\n"
         f"🔒 <b>Locked Payout:</b> ${locked_payout:,.2f}\n\n"
         f"{legs_text}"
@@ -444,6 +453,8 @@ def load_cached_odds(path: str = CACHED_ODDS_FILE) -> dict[str, Any] | None:
 def run_worker(
     sports: list[str] | None = None,
     min_ev: float = DEFAULT_MIN_EV_THRESHOLD,
+    min_arb_roi: float = DEFAULT_MIN_ARB_ROI,
+    max_bet_cap: float = MAX_SINGLE_BET,
     api_key: str | None = None,
     history_file: str = ALERT_HISTORY_FILE,
     cache_file: str = CACHED_ODDS_FILE,
@@ -457,7 +468,7 @@ def run_worker(
 
     print(f"[{now_utc.isoformat()}] Starting EV & Arbitrage alert worker...")
     print(f"Active sports: {', '.join(scan_sports)}")
-    print(f"Minimum EV threshold: {min_ev:.1f}%")
+    print(f"Minimum EV threshold: {min_ev:.1f}% | Min Arb ROI: {min_arb_roi:.1f}% | Max Bet Cap: ${max_bet_cap:.0f}")
 
     if not key:
         print(
@@ -511,7 +522,7 @@ def run_worker(
             continue
         valid_opportunities.append(opp)
 
-    # Calculate Kelly stakes and units
+    # Calculate Kelly stakes, capping any single bet at max_bet_cap ($300)
     if valid_opportunities:
         scan_stakes = calculate_capped_kelly_stakes(
             valid_opportunities,
@@ -519,14 +530,14 @@ def run_worker(
             fraction=CONFIG.kelly_fraction,
         )
         for opp, stake in zip(valid_opportunities, scan_stakes):
-            opp["kelly_stake"] = stake
+            opp["kelly_stake"] = min(float(stake), max_bet_cap)
 
-    print(f"Found {len(valid_opportunities)} eligible +EV opportunities (>= {min_ev:.1f}% EV and upcoming).")
+    print(f"Found {len(valid_opportunities)} eligible +EV opportunities (>= {min_ev:.1f}% EV, max bet=${max_bet_cap:.0f}).")
 
-    # 3. Run Arbitrage calculations ($1,000 total stake, nearest $1 rounding)
+    # 3. Run Arbitrage calculations, ensuring NO SINGLE BET exceeds max_bet_cap ($300)
     raw_arbs = find_arbitrage_opportunities(
         quotes,
-        total_stake=ARBITRAGE_TOTAL_STAKE,
+        total_stake=ARBITRAGE_TARGET_TOTAL_STAKE,
         rounding_step=1,
         config=scanner_cfg,
         now=now_utc,
@@ -536,10 +547,41 @@ def run_worker(
         commence_time = arb.get("kickoff") or arb.get("commence_time")
         if is_game_started(commence_time, now_utc):
             continue
-        if float(arb.get("profit", 0.0)) > 0:
+        roi = float(arb.get("roi_pct", 0.0))
+        if roi < min_arb_roi:
+            continue
+
+        # Scale down if any leg exceeds max_bet_cap ($300)
+        max_leg_stake = max((float(leg.get("stake", 0.0)) for leg in arb.get("legs", [])), default=0.0)
+        if max_leg_stake > max_bet_cap and max_leg_stake > 0:
+            scale_ratio = max_bet_cap / max_leg_stake
+            scaled_total = int(math.floor(float(arb["total_stake"]) * scale_ratio))
+            if scaled_total >= 2:
+                odds = [float(leg["odds_decimal"]) for leg in arb["legs"]]
+                implied_sum = float(arb["implied_probability_sum"])
+                raw_stakes = [scaled_total * (1 / price) / implied_sum for price in odds]
+                scaled_stakes = _allocate_rounded_stakes(odds, scaled_total, 1, raw_stakes)
+                if scaled_stakes is not None and all(s <= max_bet_cap for s in scaled_stakes):
+                    payouts = [s * o for s, o in zip(scaled_stakes, odds)]
+                    guaranteed = min(payouts)
+                    profit = round(guaranteed - scaled_total, 2)
+                    if profit > 0:
+                        arb["total_stake"] = scaled_total
+                        arb["profit"] = profit
+                        arb["roi_pct"] = round(profit / scaled_total * 100, 2)
+                        arb["locked_payout"] = round(guaranteed, 2)
+                        for leg, s in zip(arb["legs"], scaled_stakes):
+                            leg["stake"] = s
+                            leg["payout"] = round(s * float(leg["odds_decimal"]), 2)
+
+        if (
+            float(arb.get("profit", 0.0)) > 0
+            and float(arb.get("roi_pct", 0.0)) >= min_arb_roi
+            and all(float(leg.get("stake", 0.0)) <= max_bet_cap for leg in arb.get("legs", []))
+        ):
             valid_arbs.append(arb)
 
-    print(f"Found {len(valid_arbs)} eligible Arbitrage opportunities (stake=${ARBITRAGE_TOTAL_STAKE:,.0f}).")
+    print(f"Found {len(valid_arbs)} eligible Arbitrage opportunities (ROI >= {min_arb_roi:.1f}%, max bet=${max_bet_cap:.0f}).")
 
     # 4. Save cached odds
     save_cached_odds(quotes, valid_opportunities, valid_arbs, scan_sports, now_utc, cache_file)
