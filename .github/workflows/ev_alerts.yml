@@ -32,6 +32,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY || secrets.PROP_LINE_API_KEY || secrets.API_KEY }}
+          PROPLINE_API_KEY_BACKUP: ${{ secrets.PROPLINE_API_KEY_BACKUP || secrets.PROP_LINE_API_KEY_BACKUP || secrets.API_KEY_BACKUP }}
         run: |
           python worker.py
 

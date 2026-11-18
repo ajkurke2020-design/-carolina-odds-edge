@@ -5,6 +5,7 @@ Standalone background worker for automated +EV bet and Arbitrage notifications.
 Scans active sports via PropLine API, detects +EV opportunities against Pinnacle
 and risk-free arbitrage opportunities across approved books, caches odds data,
 tracks alert history to avoid duplicate notifications, and sends alerts to Telegram.
+Includes automatic multi-key rollover support for PropLine API quotas.
 """
 
 from __future__ import annotations
@@ -86,13 +87,43 @@ def _new_telegram_session() -> requests.Session:
     return session
 
 
-def get_api_key() -> str:
-    """Retrieve PropLine API key from environment variables."""
-    for key_name in ("PROPLINE_API_KEY", "PROP_LINE_API_KEY", "API_KEY"):
-        val = os.getenv(key_name, "").strip()
+def get_api_keys() -> list[str]:
+    """Retrieve ordered list of PropLine API keys (primary + backup) from environment variables."""
+    keys: list[str] = []
+
+    # Comma-separated list if provided
+    for key_var in ("PROPLINE_API_KEYS", "PROP_LINE_API_KEYS"):
+        val = os.getenv(key_var, "").strip()
         if val:
-            return val
-    return ""
+            for part in val.split(","):
+                k = part.strip()
+                if k and k not in keys:
+                    keys.append(k)
+
+    # Primary key names
+    for key_var in ("PROPLINE_API_KEY", "PROP_LINE_API_KEY", "API_KEY"):
+        val = os.getenv(key_var, "").strip()
+        if val and val not in keys:
+            keys.append(val)
+
+    # Backup key names
+    for key_var in (
+        "PROPLINE_API_KEY_BACKUP",
+        "PROP_LINE_API_KEY_BACKUP",
+        "PROPLINE_BACKUP_KEY",
+        "API_KEY_BACKUP",
+    ):
+        val = os.getenv(key_var, "").strip()
+        if val and val not in keys:
+            keys.append(val)
+
+    return keys
+
+
+def get_api_key() -> str:
+    """Retrieve first available PropLine API key."""
+    keys = get_api_keys()
+    return keys[0] if keys else ""
 
 
 def get_telegram_credentials() -> tuple[str, str]:
@@ -450,27 +481,90 @@ def load_cached_odds(path: str = CACHED_ODDS_FILE) -> dict[str, Any] | None:
         return None
 
 
+def fetch_odds_with_fallback(
+    sports: list[str],
+    keys: list[str],
+    mode: str = "upcoming",
+) -> tuple[dict[str, Any], str]:
+    """
+    Fetch odds using PropLine run_api, automatically rolling over to backup keys
+    if the current key hits rate limit (429), quota exhaustion, or authentication error (401).
+    """
+    if not keys:
+        return {
+            "quotes": [],
+            "errors": ["No PropLine API key configured."],
+            "warnings": [],
+            "request_count": 0,
+            "quota": {},
+        }, ""
+
+    last_result: dict[str, Any] = {"quotes": [], "errors": [], "warnings": [], "quota": {}}
+    used_key = keys[0]
+
+    for idx, key in enumerate(keys):
+        used_key = key
+        key_label = f"Key #{idx + 1}"
+        print(f"Fetching odds using PropLine {key_label}...")
+        result = run_api(sports, mode=mode, api_key=key)
+        last_result = result
+
+        errors = result.get("errors", [])
+        has_quota_or_auth_error = any(
+            ("429" in err or "quota" in err.lower() or "401" in err or "rejected" in err.lower())
+            for err in errors
+        )
+
+        remaining = result.get("quota", {}).get("X-Daily-Remaining")
+        try:
+            is_exhausted = remaining is not None and int(remaining) <= 0
+        except ValueError:
+            is_exhausted = False
+
+        if (has_quota_or_auth_error or is_exhausted) and (idx + 1 < len(keys)):
+            next_label = f"Key #{idx + 2}"
+            print(
+                f"Warning: PropLine {key_label} hit quota or rate limit. "
+                f"Rolling over to backup {next_label}...",
+                file=sys.stderr,
+            )
+            continue
+
+        return result, used_key
+
+    return last_result, used_key
+
+
 def run_worker(
     sports: list[str] | None = None,
     min_ev: float = DEFAULT_MIN_EV_THRESHOLD,
     min_arb_roi: float = DEFAULT_MIN_ARB_ROI,
     max_bet_cap: float = MAX_SINGLE_BET,
     api_key: str | None = None,
+    api_keys: list[str] | None = None,
     history_file: str = ALERT_HISTORY_FILE,
     cache_file: str = CACHED_ODDS_FILE,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Execute one scan-and-alert cycle for +EV and Arbitrage."""
+    """Execute one scan-and-alert cycle for +EV and Arbitrage with backup key support."""
     now_utc = datetime.now(timezone.utc)
     now_ts = time.time()
     scan_sports = sports or ACTIVE_SPORTS
-    key = api_key if api_key is not None else get_api_key()
+
+    # Configure API keys (supporting primary + backup rotation)
+    if api_keys:
+        keys_to_use = api_keys
+    elif api_key:
+        keys_to_use = [api_key]
+    else:
+        keys_to_use = get_api_keys()
 
     print(f"[{now_utc.isoformat()}] Starting EV & Arbitrage alert worker...")
     print(f"Active sports: {', '.join(scan_sports)}")
     print(f"Minimum EV threshold: {min_ev:.1f}% | Min Arb ROI: {min_arb_roi:.1f}% | Max Bet Cap: ${max_bet_cap:.0f}")
+    print(f"Configured PropLine API keys available: {len(keys_to_use)}")
 
-    if not key:
+    if not keys_to_use:
         print(
             "ERROR: PropLine API key is missing. Set PROPLINE_API_KEY environment variable.",
             file=sys.stderr,
@@ -490,9 +584,8 @@ def run_worker(
             "Alerts will be logged to console but not sent to Telegram."
         )
 
-    # 1. Fetch upcoming quotes
-    print("Fetching odds from PropLine API...")
-    fetch_result = run_api(scan_sports, mode="upcoming", api_key=key)
+    # 1. Fetch upcoming quotes with automated key rollover
+    fetch_result, active_key = fetch_odds_with_fallback(scan_sports, keys_to_use, mode="upcoming")
     quotes = fetch_result.get("quotes", [])
     errors = fetch_result.get("errors", [])
     warnings = fetch_result.get("warnings", [])

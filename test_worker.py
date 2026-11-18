@@ -14,9 +14,11 @@ from worker import (
     build_alert_key,
     build_arbitrage_alert_key,
     clean_expired_history,
+    fetch_odds_with_fallback,
     format_kelly_units,
     format_telegram_alert,
     format_telegram_arbitrage_alert,
+    get_api_keys,
     is_game_started,
     load_alert_history,
     load_cached_odds,
@@ -357,6 +359,52 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(result["ev_alerts_sent"], 1)
             self.assertEqual(result["arb_alerts_sent"], 1)
             self.assertEqual(mock_send.call_count, 2)
+
+    def test_get_api_keys_ordering_and_fallback(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PROPLINE_API_KEY": "primary_key",
+                "PROPLINE_API_KEY_BACKUP": "backup_key",
+            },
+            clear=True,
+        ):
+            keys = get_api_keys()
+            self.assertEqual(keys, ["primary_key", "backup_key"])
+
+    def test_fetch_odds_with_fallback_success_on_first_key(self):
+        with patch("worker.run_api") as mock_run_api:
+            mock_run_api.return_value = {
+                "quotes": [{"odds_decimal": 2.0}],
+                "errors": [],
+                "warnings": [],
+                "quota": {"X-Daily-Remaining": "500"},
+            }
+            res, used_key = fetch_odds_with_fallback(["NBA"], ["key_1", "key_2"])
+            self.assertEqual(used_key, "key_1")
+            self.assertEqual(mock_run_api.call_count, 1)
+
+    def test_fetch_odds_with_fallback_rollover_on_429(self):
+        with patch("worker.run_api") as mock_run_api:
+            # First key returns 429 quota error, second key succeeds
+            mock_run_api.side_effect = [
+                {
+                    "quotes": [],
+                    "errors": ["NBA: PropLine rate or daily quota limit reached (HTTP 429)."],
+                    "warnings": [],
+                    "quota": {"X-Daily-Remaining": "0"},
+                },
+                {
+                    "quotes": [{"odds_decimal": 2.1}],
+                    "errors": [],
+                    "warnings": [],
+                    "quota": {"X-Daily-Remaining": "995"},
+                },
+            ]
+            res, used_key = fetch_odds_with_fallback(["NBA"], ["key_1", "key_2"])
+            self.assertEqual(used_key, "key_2")
+            self.assertEqual(mock_run_api.call_count, 2)
+            self.assertEqual(len(res["quotes"]), 1)
 
 
 if __name__ == "__main__":
