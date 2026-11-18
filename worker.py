@@ -280,21 +280,31 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
     sport = html.escape(str(opp.get("sport") or "Unknown"))
     matchup = html.escape(str(opp.get("matchup") or "Unknown Matchup"))
     selection = html.escape(str(opp.get("selection") or ""))
-    market = html.escape(str(opp.get("market") or ""))
+    market_raw = str(opp.get("market") or opp.get("market_key") or "")
     line = opp.get("line") if opp.get("line") is not None else opp.get("point")
 
-    # Format Bet / Line
+    # Format market label cleanly (e.g. Spread, Total, Team Total, Moneyline)
+    if "team" in market_raw.lower():
+        market_label = f"{opp.get('team', '')} Team Total".strip()
+    elif "spread" in market_raw.lower():
+        market_label = "Spread"
+    elif "total" in market_raw.lower():
+        market_label = "Total"
+    elif "h2h" in market_raw.lower() or "moneyline" in market_raw.lower():
+        market_label = "Moneyline"
+    else:
+        market_label = market_raw
+
+    # Format Bet / Line cleanly
     if line is not None:
         try:
             line_num = float(line)
-            line_str = f"{line_num:+g}" if "spread" in market.lower() else f"{line_num:g}"
+            line_str = f"{line_num:+g}" if "spread" in market_raw.lower() else f"{line_num:g}"
         except (ValueError, TypeError):
             line_str = str(line)
-        bet_line = f"{selection} {line_str}"
-        if market and market.lower() not in bet_line.lower():
-            bet_line += f" ({market})"
+        bet_line = f"{selection} {line_str} ({market_label})"
     else:
-        bet_line = f"{selection} ({market})" if market else selection
+        bet_line = f"{selection} ({market_label})" if market_label else selection
 
     # Odds
     odds_am = opp.get("odds_american")
@@ -339,10 +349,26 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
 
     ev_pct = float(opp.get("ev_pct", 0.0))
 
-    # Recommended Kelly Stake capped at $300
-    stake = min(float(opp.get("kelly_stake", 0.0)), MAX_SINGLE_BET)
+    # Recommended Kelly Stake capped at $300 (with automatic fallback calculation)
+    raw_stake = opp.get("kelly_stake")
+    if raw_stake is None and opp.get("fair_probability") and opp.get("odds_decimal"):
+        try:
+            from ev_engine import calculate_kelly
+            quote_frac = opp.get("kelly_fraction", CONFIG.kelly_fraction)
+            net_dec = float(opp.get("odds_decimal_net", opp["odds_decimal"]))
+            k_val = calculate_kelly(CONFIG.bankroll, float(opp["fair_probability"]), net_dec, quote_frac)
+            raw_stake = min(float(k_val), CONFIG.bankroll * CONFIG.max_bet_pct)
+        except Exception:
+            raw_stake = 0.0
+
+    stake = min(float(raw_stake or 0.0), MAX_SINGLE_BET)
     units_str = format_kelly_units(stake)
-    stake_text = f"{units_str} (${stake:.2f})" if stake > 0 else "0u ($0.00)"
+    if opp.get("flags") and "verify" in str(opp.get("flags")):
+        stake_text = "0u ($0.00 - Flagged for Verification)"
+    elif stake > 0:
+        stake_text = f"{units_str} (${stake:.2f})"
+    else:
+        stake_text = "0u ($0.00)"
 
     return (
         f"🚨 <b>+EV Bet Opportunity</b> 🚨\n\n"
@@ -374,6 +400,12 @@ def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
     for i, leg in enumerate(arb.get("legs", []), start=1):
         sel = html.escape(str(leg.get("selection") or ""))
         book = html.escape(str(leg.get("sportsbook") or ""))
+        market_leg = str(leg.get("market") or "")
+        if market_leg and sel.lower() not in market_leg.lower():
+            bet_display = f"{sel} ({html.escape(market_leg)})"
+        else:
+            bet_display = sel
+
         stake = float(leg.get("stake", 0.0))
         payout = float(leg.get("payout", 0.0))
         odds_am = leg.get("odds_american")
@@ -393,7 +425,7 @@ def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
 
         legs_html.append(
             f"<b>Leg {i}:</b>\n"
-            f"• Bet: <b>{sel}</b> at <b>{book}</b>\n"
+            f"• Bet: <b>{bet_display}</b> at <b>{book}</b>\n"
             f"• Odds: {odds_str}\n"
             f"• Stake: <b>${stake:,.0f}</b> (Payout: ${payout:,.2f})"
         )
