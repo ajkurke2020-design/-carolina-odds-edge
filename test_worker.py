@@ -119,9 +119,16 @@ class WorkerTests(unittest.TestCase):
     def test_format_kelly_units_and_cap_at_300(self):
         # Default bankroll is 1000, 1 unit = $10
         self.assertEqual(format_kelly_units(0.0), "0u")
+        # Sub-unit positive stake floors to 0.25u minimum
+        self.assertEqual(format_kelly_units(1.0), "0.25u")
+        # 0.25u increments
+        self.assertEqual(format_kelly_units(2.5), "0.25u")
         self.assertEqual(format_kelly_units(5.0), "0.5u")
+        self.assertEqual(format_kelly_units(7.5), "0.75u")
         self.assertEqual(format_kelly_units(10.0), "1u")
+        self.assertEqual(format_kelly_units(12.5), "1.25u")
         self.assertEqual(format_kelly_units(15.0), "1.5u")
+        self.assertEqual(format_kelly_units(17.5), "1.75u")
         self.assertEqual(format_kelly_units(20.0), "2u")
         self.assertEqual(format_kelly_units(300.0), "30u")
         # Over $300 should be capped at 30u ($300)

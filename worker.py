@@ -254,19 +254,20 @@ def format_kelly_units(
     stake: float, bankroll: float = CONFIG.bankroll, max_single_bet: float = MAX_SINGLE_BET
 ) -> str:
     """
-    Format recommended Kelly stake into standard sports betting units (0.5u, 1u, etc.).
+    Format recommended Kelly stake into standard sports betting units in 0.25u increments
+    (e.g., 0.25u, 0.5u, 0.75u, 1u, 1.25u, 1.5u, 1.75u, 2u).
     Capped at max_single_bet ($300).
     1 unit is defined as 1% of the bankroll ($10 for default $1,000 bankroll).
-    Rounds to the nearest 0.5 unit.
+    Rounds to the nearest 0.25 unit.
     """
     effective_stake = min(stake, max_single_bet)
     unit_size = bankroll * 0.01
     if effective_stake <= 0 or unit_size <= 0:
         return "0u"
     raw_units = effective_stake / unit_size
-    rounded = round(raw_units * 2) / 2
+    rounded = round(raw_units * 4) / 4
     if rounded == 0 and effective_stake > 0:
-        rounded = 0.5
+        rounded = 0.25
     if rounded.is_integer():
         return f"{int(rounded)}u"
     return f"{rounded:g}u"
@@ -465,9 +466,9 @@ def format_welcome_guide(greeting_name: str | None = None) -> str:
         f"A unit is a standardized bet size based on <b>your own bankroll</b>:\n"
         f"👉 <b>1 unit (1u) = 1% of your total betting bankroll.</b>\n"
         f"<i>Examples:</i>\n"
-        f"• $500 bankroll ➔ 1u = $5 (0.5u = $2.50)\n"
-        f"• $1,000 bankroll ➔ 1u = $10 (0.5u = $5.00)\n"
-        f"• $5,000 bankroll ➔ 1u = $50 (0.5u = $25.00)\n"
+        f"• $500 bankroll ➔ 1u = $5 (0.5u = $2.50, 0.75u = $3.75)\n"
+        f"• $1,000 bankroll ➔ 1u = $10 (0.75u = $7.50, 1.25u = $12.50)\n"
+        f"• $5,000 bankroll ➔ 1u = $50 (0.5u = $25.00, 1.5u = $75.00)\n"
         f"Never risk more than the recommended unit size to protect against normal variance.\n\n"
         f"• <b>What is an Arbitrage Alert (⚡)?</b>\n"
         f"A 100% risk-free trade where two sportsbooks disagree on odds. You bet both sides and lock in a guaranteed profit before the game even starts.\n\n"
