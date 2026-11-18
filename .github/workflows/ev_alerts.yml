@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# Only one run at a time, so overlapping runs cannot race on the same JSON files.
+concurrency:
+  group: ev-alerts
+  cancel-in-progress: false
+
 jobs:
   scan-and-alert:
     runs-on: ubuntu-latest
@@ -46,5 +51,6 @@ jobs:
           [ -f cached_odds.json ] && git add cached_odds.json
           if ! git diff --cached --quiet; then
             git commit -m "Update alert history and cached odds [skip ci]"
-            git push
+            git pull --rebase origin main
+            git push origin main
           fi
