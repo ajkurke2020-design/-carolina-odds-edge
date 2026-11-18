@@ -32,6 +32,7 @@ from scanner_logic import (
 from app_auth import passphrase_matches
 from propline_api import APPROVED_BOOKMAKERS, EASTERN, SPORT_CONFIG, run_api
 from scanner_config import CONFIG
+from worker import load_cached_odds
 
 
 def _request_ev_bet_log() -> None:
@@ -442,9 +443,19 @@ header, scan_action = st.columns([4, 1])
 with header:
     st.title("NC Odds Edge")
     st.caption("Odds comparison, estimated value, and arbitrage opportunities")
+cached_payload = load_cached_odds()
 with scan_action:
     st.markdown('<span class="edge-pill">PROPLINE API</span>', unsafe_allow_html=True)
     scan_button = st.button("Scan odds", type="primary", width="stretch")
+    load_cache_button = (
+        st.button(
+            "Load cached",
+            width="stretch",
+            help="Load recent odds saved by the background worker without using API calls.",
+        )
+        if cached_payload and cached_payload.get("quotes")
+        else False
+    )
 
 if bet_log_notice := st.session_state.pop("bet_log_notice", None):
     st.success(bet_log_notice)
@@ -468,6 +479,44 @@ st.info(
     "upcoming games must start after the current US Eastern time. "
     "Confirm availability, fees, and settlement rules at the venue before acting."
 )
+
+if load_cache_button and cached_payload and cached_payload.get("quotes"):
+    cached_quotes = cached_payload["quotes"]
+    cached_at = cached_payload.get("cached_at", "")
+    with st.spinner("Processing cached odds..."):
+        scan_result = scan_pinnacle_ev(cached_quotes)
+        all_ev_rows = scan_result["opportunities"]
+        for row in scan_result["eligible_rows"]:
+            if row["pricing_method"] == "line-adjusted":
+                row["kelly_fraction"] = line_adjusted_kelly_fraction
+        scan_stakes = calculate_capped_kelly_stakes(
+            all_ev_rows, bankroll, kelly_fraction
+        )
+        for row, stake in zip(all_ev_rows, scan_stakes):
+            row["kelly_stake"] = stake
+        st.session_state["quotes"] = [
+            quote
+            for quote in cached_quotes
+            if quote.get("sportsbook") in DEFAULT_BOOKS
+        ]
+        st.session_state["ev_candidates"] = scan_result["eligible_rows"]
+        st.session_state["scan_diagnostics"] = scan_result["diagnostics"]
+        st.session_state["scan_errors"] = []
+        st.session_state["scan_warnings"] = []
+        st.session_state["request_count"] = 0
+        st.session_state["quota"] = {"X-Daily-Remaining": "Cached (0 calls)"}
+        time_display = (
+            cached_at[:19].replace("T", " ") if cached_at else "recent"
+        )
+        st.session_state["last_scan"] = {
+            "mode": scan_mode,
+            "time": f"{time_display} UTC (Cached)",
+        }
+        if st.session_state["quotes"]:
+            st.session_state["pending_book_selection"] = sorted(
+                {quote["sportsbook"] for quote in st.session_state["quotes"]}
+            )
+        st.rerun()
 
 if scan_button:
     requested_mode = "live" if scan_mode == "Live" else "upcoming"
@@ -711,7 +760,12 @@ with tab_ev:
         unsafe_allow_html=True,
     )
     if not all_quotes:
-        st.info("No odds loaded yet. Choose sports in the sidebar and run a scan.")
+        if cached_payload and cached_payload.get("quotes"):
+            st.info(
+                "No odds loaded yet. Click **Load cached** above to view the background worker's latest scan without using API quota, or select sports and click **Scan odds**."
+            )
+        else:
+            st.info("No odds loaded yet. Choose sports in the sidebar and run a scan.")
     elif not filtered_quotes:
         st.info("No quotes match the selected sports, venues, or matchup search.")
     elif not ev_opportunities:

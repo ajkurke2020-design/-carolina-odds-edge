@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Standalone background worker for automated +EV bet notifications.
+Standalone background worker for automated +EV bet and Arbitrage notifications.
 
 Scans active sports via PropLine API, detects +EV opportunities against Pinnacle
-using existing scanner logic, caches odds data, tracks alert history to avoid
-duplicate notifications, and sends alerts to Telegram.
+and risk-free arbitrage opportunities across approved books, caches odds data,
+tracks alert history to avoid duplicate notifications, and sends alerts to Telegram.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import socket
 import sys
 import time
 from dataclasses import replace
@@ -19,11 +20,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPSConnection
+from urllib3.connectionpool import HTTPSConnectionPool
+from urllib3.util import connection as urllib3_connection
 
-from ev_engine import decimal_to_american
+from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
 from propline_api import SPORT_CONFIG, run_api
 from scanner_config import CONFIG
-from scanner_logic import scan_pinnacle_ev
+from scanner_logic import find_arbitrage_opportunities, scan_pinnacle_ev
 
 # Active sports to scan (MLB commented out for the offseason)
 ACTIVE_SPORTS = [
@@ -40,7 +45,40 @@ ALERT_HISTORY_FILE = "alert_history.json"
 CACHED_ODDS_FILE = "cached_odds.json"
 DEFAULT_MIN_EV_THRESHOLD = 3.0
 DEFAULT_MIN_EV_INCREASE_FOR_RE_ALERT = 1.5
+DEFAULT_MIN_ROI_INCREASE_FOR_ARB = 0.5
 MAX_HISTORY_AGE_SECONDS = 48 * 3600  # 48 hours
+ARBITRAGE_TOTAL_STAKE = 1000.0  # $1,000 stake for arbitrage opportunities
+
+
+# --- IPv4 Adapter for Telegram API (prevents IPv6 connection resets on Windows/ISPs) ---
+class _IPv4HTTPSConnection(HTTPSConnection):
+    def _new_conn(self) -> socket.socket:
+        address = socket.getaddrinfo(
+            self._dns_host, self.port, socket.AF_INET, socket.SOCK_STREAM
+        )[0][4][0]
+        return urllib3_connection.create_connection(
+            (address, self.port),
+            self.timeout,
+            source_address=self.source_address,
+            socket_options=self.socket_options,
+        )
+
+
+class _IPv4HTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _IPv4HTTPSConnection
+
+
+class _TelegramIPv4Adapter(HTTPAdapter):
+    def init_poolmanager(self, connections: int, maxsize: int, block: bool = False, **pool_kwargs: Any) -> None:
+        super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+        self.poolmanager.pool_classes_by_scheme = dict(self.poolmanager.pool_classes_by_scheme)
+        self.poolmanager.pool_classes_by_scheme["https"] = _IPv4HTTPSConnectionPool
+
+
+def _new_telegram_session() -> requests.Session:
+    session = requests.Session()
+    session.mount("https://api.telegram.org/", _TelegramIPv4Adapter())
+    return session
 
 
 def get_api_key() -> str:
@@ -74,7 +112,7 @@ def is_game_started(commence_time_str: str | None, now_utc: datetime) -> bool:
 
 def build_alert_key(opp: dict[str, Any]) -> str:
     """
-    Generate unique tracking key for an opportunity:
+    Generate unique tracking key for a +EV opportunity:
     {game_id}_{market}_{selection}_{line}_{sportsbook}
     """
     game_id = str(opp.get("event_id") or opp.get("game_id") or "")
@@ -84,6 +122,22 @@ def build_alert_key(opp: dict[str, Any]) -> str:
     line_str = str(line_val) if line_val is not None else "None"
     sportsbook = str(opp.get("sportsbook") or "")
     return f"{game_id}_{market}_{selection}_{line_str}_{sportsbook}"
+
+
+def build_arbitrage_alert_key(arb: dict[str, Any]) -> str:
+    """
+    Generate unique tracking key for an arbitrage opportunity:
+    arb_{game_id}_{market}_{sorted_legs}
+    """
+    game_id = str(arb.get("event_id") or "")
+    market = str(arb.get("market") or arb.get("market_key") or "")
+    legs_repr = "-".join(
+        sorted(
+            f"{leg.get('selection')}_{leg.get('sportsbook')}"
+            for leg in arb.get("legs", [])
+        )
+    )
+    return f"arb_{game_id}_{market}_{legs_repr}"
 
 
 def load_alert_history(path: str = ALERT_HISTORY_FILE) -> dict[str, dict[str, Any]]:
@@ -133,7 +187,7 @@ def should_alert(
     min_increase: float = DEFAULT_MIN_EV_INCREASE_FOR_RE_ALERT,
 ) -> bool:
     """
-    Determine whether to send an alert:
+    Determine whether to send a +EV alert:
     True if the key is new, OR if EV% on that exact same line increased by >= +1.5%.
     """
     if key not in history:
@@ -143,10 +197,45 @@ def should_alert(
     return (current_ev - prev_ev) >= min_increase
 
 
+def should_alert_arbitrage(
+    key: str,
+    current_roi: float,
+    history: dict[str, dict[str, Any]],
+    min_increase: float = DEFAULT_MIN_ROI_INCREASE_FOR_ARB,
+) -> bool:
+    """
+    Determine whether to send an Arbitrage alert:
+    True if the key is new, OR if ROI% on that opportunity increased by >= +0.5%.
+    """
+    if key not in history:
+        return True
+    prev_entry = history[key]
+    prev_roi = float(prev_entry.get("roi", 0.0))
+    return (current_roi - prev_roi) >= min_increase
+
+
+def format_kelly_units(stake: float, bankroll: float = CONFIG.bankroll) -> str:
+    """
+    Format recommended Kelly stake into standard sports betting units (0.5u, 1u, etc.).
+    1 unit is defined as 1% of the bankroll ($10 for a default $1,000 bankroll).
+    Rounds to the nearest 0.5 unit.
+    """
+    unit_size = bankroll * 0.01
+    if stake <= 0 or unit_size <= 0:
+        return "0u"
+    raw_units = stake / unit_size
+    rounded = round(raw_units * 2) / 2
+    if rounded == 0 and stake > 0:
+        rounded = 0.5
+    if rounded.is_integer():
+        return f"{int(rounded)}u"
+    return f"{rounded:g}u"
+
+
 def format_telegram_alert(opp: dict[str, Any]) -> str:
     """
-    Format opportunity cleanly with HTML showing:
-    Sport, Matchup, Bet/Line, Odds, Sportsbook, Fair Odds, and EV%.
+    Format +EV opportunity cleanly with HTML showing:
+    Sport, Matchup, Bet/Line, Odds, Sportsbook, Fair Odds, EV%, and Recommended Kelly Units.
     """
     sport = html.escape(str(opp.get("sport") or "Unknown"))
     matchup = html.escape(str(opp.get("matchup") or "Unknown Matchup"))
@@ -210,6 +299,11 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
 
     ev_pct = float(opp.get("ev_pct", 0.0))
 
+    # Recommended Kelly Stake in units and dollars
+    stake = float(opp.get("kelly_stake", 0.0))
+    units_str = format_kelly_units(stake)
+    stake_text = f"{units_str} (${stake:.2f})" if stake > 0 else "0u ($0.00)"
+
     return (
         f"🚨 <b>+EV Bet Opportunity</b> 🚨\n\n"
         f"🏆 <b>Sport:</b> {sport}\n"
@@ -218,14 +312,70 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
         f"💰 <b>Odds:</b> {odds_str}\n"
         f"🏢 <b>Sportsbook:</b> {sportsbook}\n"
         f"⚖️ <b>Fair Odds:</b> {fair_str}\n"
-        f"📈 <b>EV%:</b> +{ev_pct:.2f}%"
+        f"📈 <b>EV%:</b> +{ev_pct:.2f}%\n"
+        f"💵 <b>Recommended Stake:</b> {stake_text}"
+    )
+
+
+def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
+    """
+    Format Arbitrage opportunity cleanly with HTML showing:
+    Sport, Matchup, Market, Total Stake ($1,000 rounded to $1), Guaranteed Profit, ROI%, and Leg Stakes.
+    """
+    sport = html.escape(str(arb.get("sport") or "Unknown"))
+    matchup = html.escape(str(arb.get("matchup") or "Unknown Matchup"))
+    market = html.escape(str(arb.get("market") or ""))
+    total_stake = float(arb.get("total_stake", ARBITRAGE_TOTAL_STAKE))
+    profit = float(arb.get("profit", 0.0))
+    roi_pct = float(arb.get("roi_pct", 0.0))
+    locked_payout = float(arb.get("locked_payout", total_stake + profit))
+
+    legs_html = []
+    for i, leg in enumerate(arb.get("legs", []), start=1):
+        sel = html.escape(str(leg.get("selection") or ""))
+        book = html.escape(str(leg.get("sportsbook") or ""))
+        stake = float(leg.get("stake", 0.0))
+        payout = float(leg.get("payout", 0.0))
+        odds_am = leg.get("odds_american")
+        odds_dec = leg.get("odds_decimal")
+        if odds_am is not None:
+            try:
+                am_int = int(odds_am)
+                odds_str = f"{am_int:+d}"
+            except (ValueError, TypeError):
+                odds_str = str(odds_am)
+        elif odds_dec is not None:
+            odds_str = f"{decimal_to_american(float(odds_dec)):+d}"
+        else:
+            odds_str = "N/A"
+        if odds_dec is not None:
+            odds_str += f" ({float(odds_dec):.2f})"
+
+        legs_html.append(
+            f"<b>Leg {i}:</b>\n"
+            f"• Bet: <b>{sel}</b> at <b>{book}</b>\n"
+            f"• Odds: {odds_str}\n"
+            f"• Stake: <b>${stake:,.0f}</b> (Payout: ${payout:,.2f})"
+        )
+
+    legs_text = "\n\n".join(legs_html)
+
+    return (
+        f"⚡ <b>Arbitrage Opportunity (Guaranteed Profit)</b> ⚡\n\n"
+        f"🏆 <b>Sport:</b> {sport}\n"
+        f"⚔️ <b>Matchup:</b> {matchup}\n"
+        f"🎯 <b>Market:</b> {market}\n"
+        f"💰 <b>Total Stake:</b> ${total_stake:,.0f} (nearest $1)\n"
+        f"💵 <b>Guaranteed Profit:</b> +${profit:.2f} (ROI: +{roi_pct:.2f}%)\n"
+        f"🔒 <b>Locked Payout:</b> ${locked_payout:,.2f}\n\n"
+        f"{legs_text}"
     )
 
 
 def send_telegram_message(
     bot_token: str, chat_id: str, message: str, timeout: int = 15
 ) -> bool:
-    """Send message via Telegram Bot API sendMessage."""
+    """Send message via Telegram Bot API sendMessage using IPv4 session."""
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -235,8 +385,9 @@ def send_telegram_message(
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    session = _new_telegram_session()
     try:
-        response = requests.post(url, json=payload, timeout=timeout)
+        response = session.post(url, json=payload, timeout=timeout)
         if response.status_code == 200:
             return True
         print(
@@ -247,23 +398,28 @@ def send_telegram_message(
     except requests.RequestException as error:
         print(f"Telegram request failed: {error}", file=sys.stderr)
         return False
+    finally:
+        session.close()
 
 
 def save_cached_odds(
     quotes: list[dict[str, Any]],
     opportunities: list[dict[str, Any]],
+    arbitrage: list[dict[str, Any]],
     sports: list[str],
     now_utc: datetime,
     path: str = CACHED_ODDS_FILE,
 ) -> None:
-    """Cache fetched odds data and opportunities to JSON."""
+    """Cache fetched odds data, +EV opportunities, and Arbitrage to JSON."""
     data = {
         "cached_at": now_utc.isoformat(),
         "sports": sports,
         "quotes_count": len(quotes),
         "opportunities_count": len(opportunities),
+        "arbitrage_count": len(arbitrage),
         "quotes": quotes,
         "opportunities": opportunities,
+        "arbitrage": arbitrage,
     }
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -293,13 +449,13 @@ def run_worker(
     cache_file: str = CACHED_ODDS_FILE,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Execute one scan-and-alert cycle."""
+    """Execute one scan-and-alert cycle for +EV and Arbitrage."""
     now_utc = datetime.now(timezone.utc)
     now_ts = time.time()
     scan_sports = sports or ACTIVE_SPORTS
     key = api_key if api_key is not None else get_api_key()
 
-    print(f"[{now_utc.isoformat()}] Starting EV alert worker...")
+    print(f"[{now_utc.isoformat()}] Starting EV & Arbitrage alert worker...")
     print(f"Active sports: {', '.join(scan_sports)}")
     print(f"Minimum EV threshold: {min_ev:.1f}%")
 
@@ -311,7 +467,8 @@ def run_worker(
         return {
             "success": False,
             "error": "Missing PropLine API key",
-            "alerts_sent": 0,
+            "ev_alerts_sent": 0,
+            "arb_alerts_sent": 0,
         }
 
     bot_token, chat_id = get_telegram_credentials()
@@ -343,7 +500,7 @@ def run_worker(
     scan_res = scan_pinnacle_ev(quotes, config=scanner_cfg, now=now_utc)
     raw_opportunities = scan_res.get("opportunities", [])
 
-    # 3. Filter out games that have already started and EV < threshold
+    # Filter out games that have already started and EV < threshold
     valid_opportunities = []
     for opp in raw_opportunities:
         ev = float(opp.get("ev_pct", 0.0))
@@ -354,11 +511,39 @@ def run_worker(
             continue
         valid_opportunities.append(opp)
 
+    # Calculate Kelly stakes and units
+    if valid_opportunities:
+        scan_stakes = calculate_capped_kelly_stakes(
+            valid_opportunities,
+            bankroll=CONFIG.bankroll,
+            fraction=CONFIG.kelly_fraction,
+        )
+        for opp, stake in zip(valid_opportunities, scan_stakes):
+            opp["kelly_stake"] = stake
+
     print(f"Found {len(valid_opportunities)} eligible +EV opportunities (>= {min_ev:.1f}% EV and upcoming).")
 
+    # 3. Run Arbitrage calculations ($1,000 total stake, nearest $1 rounding)
+    raw_arbs = find_arbitrage_opportunities(
+        quotes,
+        total_stake=ARBITRAGE_TOTAL_STAKE,
+        rounding_step=1,
+        config=scanner_cfg,
+        now=now_utc,
+    )
+    valid_arbs = []
+    for arb in raw_arbs:
+        commence_time = arb.get("kickoff") or arb.get("commence_time")
+        if is_game_started(commence_time, now_utc):
+            continue
+        if float(arb.get("profit", 0.0)) > 0:
+            valid_arbs.append(arb)
+
+    print(f"Found {len(valid_arbs)} eligible Arbitrage opportunities (stake=${ARBITRAGE_TOTAL_STAKE:,.0f}).")
+
     # 4. Save cached odds
-    save_cached_odds(quotes, valid_opportunities, scan_sports, now_utc, cache_file)
-    print(f"Saved {len(quotes)} quotes and {len(valid_opportunities)} opportunities to {cache_file}.")
+    save_cached_odds(quotes, valid_opportunities, valid_arbs, scan_sports, now_utc, cache_file)
+    print(f"Saved {len(quotes)} quotes, {len(valid_opportunities)} EV opps, and {len(valid_arbs)} arbs to {cache_file}.")
 
     # 5. Load and clean alert history
     history = load_alert_history(history_file)
@@ -368,8 +553,8 @@ def run_worker(
     if pruned > 0:
         print(f"Pruned {pruned} alert history entries older than 48 hours.")
 
-    # 6. Evaluate and dispatch alerts
-    alerts_sent = 0
+    # 6. Evaluate and dispatch +EV alerts
+    ev_alerts_sent = 0
     for opp in valid_opportunities:
         alert_key = build_alert_key(opp)
         ev = float(opp.get("ev_pct", 0.0))
@@ -380,26 +565,54 @@ def run_worker(
         message = format_telegram_alert(opp)
 
         if telegram_configured and not dry_run:
-            print(f"Sending Telegram alert for {alert_key} (+{ev:.2f}% EV)...")
+            print(f"Sending Telegram +EV alert for {alert_key} (+{ev:.2f}% EV)...")
             success = send_telegram_message(bot_token, chat_id, message)
             if success:
-                alerts_sent += 1
+                ev_alerts_sent += 1
                 history[alert_key] = {"ev": ev, "timestamp": now_ts}
-                time.sleep(0.15)  # Brief pause to avoid Telegram rate limits
+                time.sleep(0.15)
         else:
-            print(f"[CONSOLE ALERT] {alert_key} (+{ev:.2f}% EV):\n{message}\n")
-            alerts_sent += 1
+            print(f"[CONSOLE +EV ALERT] {alert_key} (+{ev:.2f}% EV):\n{message}\n")
+            ev_alerts_sent += 1
             history[alert_key] = {"ev": ev, "timestamp": now_ts}
 
-    # 7. Persist updated history
+    # 7. Evaluate and dispatch Arbitrage alerts
+    arb_alerts_sent = 0
+    for arb in valid_arbs:
+        arb_key = build_arbitrage_alert_key(arb)
+        roi = float(arb.get("roi_pct", 0.0))
+
+        if not should_alert_arbitrage(arb_key, roi, history):
+            continue
+
+        message = format_telegram_arbitrage_alert(arb)
+
+        if telegram_configured and not dry_run:
+            print(f"Sending Telegram Arbitrage alert for {arb_key} (+{roi:.2f}% ROI)...")
+            success = send_telegram_message(bot_token, chat_id, message)
+            if success:
+                arb_alerts_sent += 1
+                history[arb_key] = {"roi": roi, "timestamp": now_ts}
+                time.sleep(0.15)
+        else:
+            print(f"[CONSOLE ARB ALERT] {arb_key} (+{roi:.2f}% ROI):\n{message}\n")
+            arb_alerts_sent += 1
+            history[arb_key] = {"roi": roi, "timestamp": now_ts}
+
+    # 8. Persist updated history
     save_alert_history(history, history_file)
-    print(f"Alert cycle complete. Alerts dispatched: {alerts_sent}. Active tracked bets: {len(history)}.")
+    print(
+        f"Alert cycle complete. +EV alerts: {ev_alerts_sent}, Arb alerts: {arb_alerts_sent}. "
+        f"Total active tracked items: {len(history)}."
+    )
 
     return {
         "success": True,
         "quotes_fetched": len(quotes),
         "eligible_opportunities": len(valid_opportunities),
-        "alerts_sent": alerts_sent,
+        "eligible_arbitrages": len(valid_arbs),
+        "ev_alerts_sent": ev_alerts_sent,
+        "arb_alerts_sent": arb_alerts_sent,
         "tracked_bets": len(history),
     }
 

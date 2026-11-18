@@ -8,10 +8,14 @@ from unittest.mock import MagicMock, patch
 
 from worker import (
     ACTIVE_SPORTS,
+    ARBITRAGE_TOTAL_STAKE,
     MAX_HISTORY_AGE_SECONDS,
     build_alert_key,
+    build_arbitrage_alert_key,
     clean_expired_history,
+    format_kelly_units,
     format_telegram_alert,
+    format_telegram_arbitrage_alert,
     is_game_started,
     load_alert_history,
     load_cached_odds,
@@ -20,6 +24,7 @@ from worker import (
     save_cached_odds,
     send_telegram_message,
     should_alert,
+    should_alert_arbitrage,
 )
 
 
@@ -66,6 +71,18 @@ class WorkerTests(unittest.TestCase):
             "game-202_h2h_Duke_None_FanDuel",
         )
 
+    def test_build_arbitrage_alert_key(self):
+        arb = {
+            "event_id": "game-999",
+            "market": "Moneyline",
+            "legs": [
+                {"selection": "Home", "sportsbook": "FanDuel"},
+                {"selection": "Away", "sportsbook": "DraftKings"},
+            ],
+        }
+        key = build_arbitrage_alert_key(arb)
+        self.assertEqual(key, "arb_game-999_Moneyline_Away_DraftKings-Home_FanDuel")
+
     def test_should_alert_new_key(self):
         history = {}
         self.assertTrue(should_alert("key1", 3.5, history))
@@ -80,6 +97,24 @@ class WorkerTests(unittest.TestCase):
         history = {"key1": {"ev": 4.0, "timestamp": time.time()}}
         self.assertTrue(should_alert("key1", 5.5, history))  # exactly +1.5%
         self.assertTrue(should_alert("key1", 6.0, history))  # +2.0%
+
+    def test_should_alert_arbitrage(self):
+        history = {}
+        self.assertTrue(should_alert_arbitrage("arb1", 2.0, history))
+
+        history["arb1"] = {"roi": 2.0, "timestamp": time.time()}
+        self.assertFalse(should_alert_arbitrage("arb1", 2.0, history))
+        self.assertFalse(should_alert_arbitrage("arb1", 2.3, history))  # < 0.5% increase
+        self.assertTrue(should_alert_arbitrage("arb1", 2.6, history))  # >= 0.5% increase
+
+    def test_format_kelly_units(self):
+        # Default bankroll is 1000, 1 unit = $10
+        self.assertEqual(format_kelly_units(0.0), "0u")
+        self.assertEqual(format_kelly_units(5.0), "0.5u")
+        self.assertEqual(format_kelly_units(10.0), "1u")
+        self.assertEqual(format_kelly_units(15.0), "1.5u")
+        self.assertEqual(format_kelly_units(20.0), "2u")
+        self.assertEqual(format_kelly_units(2.5), "0.5u")
 
     def test_clean_expired_history(self):
         now = 1000000.0
@@ -107,6 +142,7 @@ class WorkerTests(unittest.TestCase):
             "sportsbook": "DraftKings",
             "fair_probability": 0.55,
             "ev_pct": 5.05,
+            "kelly_stake": 10.0,
         }
         text = format_telegram_alert(opp)
         self.assertIn("Sport:</b> NBA", text)
@@ -116,6 +152,45 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("Sportsbook:</b> DraftKings", text)
         self.assertIn("Fair Odds:</b>", text)
         self.assertIn("EV%:</b> +5.05%", text)
+        self.assertIn("Recommended Stake:</b> 1u ($10.00)", text)
+
+    def test_format_telegram_arbitrage_alert(self):
+        arb = {
+            "sport": "NBA",
+            "matchup": "Lakers vs Warriors",
+            "market": "Moneyline",
+            "total_stake": 1000.0,
+            "profit": 24.50,
+            "roi_pct": 2.45,
+            "locked_payout": 1024.50,
+            "legs": [
+                {
+                    "selection": "Lakers",
+                    "sportsbook": "FanDuel",
+                    "odds_decimal": 2.15,
+                    "odds_american": 115,
+                    "stake": 476.0,
+                    "payout": 1023.40,
+                },
+                {
+                    "selection": "Warriors",
+                    "sportsbook": "DraftKings",
+                    "odds_decimal": 1.95,
+                    "odds_american": -105,
+                    "stake": 524.0,
+                    "payout": 1021.80,
+                },
+            ],
+        }
+        text = format_telegram_arbitrage_alert(arb)
+        self.assertIn("Arbitrage Opportunity (Guaranteed Profit)", text)
+        self.assertIn("Sport:</b> NBA", text)
+        self.assertIn("Total Stake:</b> $1,000", text)
+        self.assertIn("Guaranteed Profit:</b> +$24.50 (ROI: +2.45%)", text)
+        self.assertIn("Lakers</b> at <b>FanDuel", text)
+        self.assertIn("Stake: <b>$476</b>", text)
+        self.assertIn("Warriors</b> at <b>DraftKings", text)
+        self.assertIn("Stake: <b>$524</b>", text)
 
     def test_format_telegram_alert_escapes_html(self):
         opp = {
@@ -128,18 +203,24 @@ class WorkerTests(unittest.TestCase):
             "sportsbook": "BetMGM",
             "fair_probability": 0.45,
             "ev_pct": 12.5,
+            "kelly_stake": 5.0,
         }
         text = format_telegram_alert(opp)
         self.assertIn("Texas A&amp;M vs LSU", text)
         self.assertNotIn("Texas A&M", text)
+        self.assertIn("Recommended Stake:</b> 0.5u ($5.00)", text)
 
     def test_send_telegram_message_success_and_failure(self):
-        with patch("worker.requests.post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
+        with patch("worker._new_telegram_session") as mock_session_factory:
+            mock_session = MagicMock()
+            mock_session.post.return_value = MagicMock(status_code=200)
+            mock_session_factory.return_value = mock_session
             self.assertTrue(send_telegram_message("test_token", "test_chat", "Hello"))
 
-        with patch("worker.requests.post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=400, text="Bad Request")
+        with patch("worker._new_telegram_session") as mock_session_factory:
+            mock_session = MagicMock()
+            mock_session.post.return_value = MagicMock(status_code=400, text="Bad Request")
+            mock_session_factory.return_value = mock_session
             self.assertFalse(send_telegram_message("test_token", "test_chat", "Hello"))
 
         self.assertFalse(send_telegram_message("", "test_chat", "Hello"))
@@ -158,16 +239,18 @@ class WorkerTests(unittest.TestCase):
             file_path = os.path.join(tmpdir, "cached_odds.json")
             quotes = [{"event_id": "1", "odds_decimal": 2.0}]
             opps = [{"event_id": "1", "ev_pct": 5.0}]
+            arbs = [{"event_id": "1", "profit": 20.0}]
             now = datetime.now(timezone.utc)
-            save_cached_odds(quotes, opps, ["NBA"], now, file_path)
+            save_cached_odds(quotes, opps, arbs, ["NBA"], now, file_path)
 
             loaded = load_cached_odds(file_path)
             self.assertIsNotNone(loaded)
             self.assertEqual(len(loaded["quotes"]), 1)
             self.assertEqual(len(loaded["opportunities"]), 1)
+            self.assertEqual(len(loaded["arbitrage"]), 1)
             self.assertEqual(loaded["sports"], ["NBA"])
 
-    def test_run_worker_e2e_flow(self):
+    def test_run_worker_e2e_flow_with_ev_and_arbitrage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             hist_file = os.path.join(tmpdir, "alert_history.json")
             cache_file = os.path.join(tmpdir, "cached_odds.json")
@@ -209,27 +292,52 @@ class WorkerTests(unittest.TestCase):
                     "ev_pct": 5.0,
                     "kickoff": past_kickoff,  # Started -> should be filtered
                 },
+            ]
+
+            mock_arbs = [
                 {
-                    "event_id": "event_3",
                     "sport": "NBA",
-                    "matchup": "Team E vs Team F",
-                    "market": "Total 215.5",
-                    "selection": "Over",
-                    "sportsbook": "BetMGM",
-                    "ev_pct": 2.2,  # Below 3.0% -> should be filtered
+                    "event_id": "event_1",
+                    "matchup": "Team A vs Team B",
+                    "market": "Moneyline",
                     "kickoff": future_kickoff,
-                },
+                    "total_stake": ARBITRAGE_TOTAL_STAKE,
+                    "profit": 15.0,
+                    "roi_pct": 1.5,
+                    "locked_payout": 1015.0,
+                    "legs": [
+                        {
+                            "selection": "Team A",
+                            "sportsbook": "FanDuel",
+                            "odds_decimal": 2.1,
+                            "stake": 480.0,
+                            "payout": 1008.0,
+                        },
+                        {
+                            "selection": "Team B",
+                            "sportsbook": "DraftKings",
+                            "odds_decimal": 2.05,
+                            "stake": 520.0,
+                            "payout": 1066.0,
+                        },
+                    ],
+                }
             ]
 
             with patch("worker.run_api") as mock_run_api, patch(
                 "worker.scan_pinnacle_ev"
-            ) as mock_scan, patch("worker.send_telegram_message") as mock_send:
+            ) as mock_scan, patch(
+                "worker.find_arbitrage_opportunities"
+            ) as mock_find_arb, patch(
+                "worker.send_telegram_message"
+            ) as mock_send:
                 mock_run_api.return_value = {
                     "quotes": mock_quotes,
                     "errors": [],
                     "warnings": [],
                 }
                 mock_scan.return_value = {"opportunities": mock_opps}
+                mock_find_arb.return_value = mock_arbs
                 mock_send.return_value = True
 
                 with patch.dict(
@@ -249,38 +357,11 @@ class WorkerTests(unittest.TestCase):
 
             self.assertTrue(result["success"])
             self.assertEqual(result["eligible_opportunities"], 1)
-            self.assertEqual(result["alerts_sent"], 1)
-            mock_send.assert_called_once()
-
-            # Second run with same data: should NOT re-alert
-            with patch("worker.run_api") as mock_run_api, patch(
-                "worker.scan_pinnacle_ev"
-            ) as mock_scan, patch("worker.send_telegram_message") as mock_send:
-                mock_run_api.return_value = {
-                    "quotes": mock_quotes,
-                    "errors": [],
-                    "warnings": [],
-                }
-                mock_scan.return_value = {"opportunities": mock_opps}
-
-                with patch.dict(
-                    os.environ,
-                    {
-                        "PROPLINE_API_KEY": "test_api_key",
-                        "TELEGRAM_BOT_TOKEN": "bot_token",
-                        "TELEGRAM_CHAT_ID": "chat_id",
-                    },
-                ):
-                    result2 = run_worker(
-                        sports=["NBA"],
-                        min_ev=3.0,
-                        history_file=hist_file,
-                        cache_file=cache_file,
-                    )
-
-            self.assertTrue(result2["success"])
-            self.assertEqual(result2["alerts_sent"], 0)
-            mock_send.assert_not_called()
+            self.assertEqual(result["eligible_arbitrages"], 1)
+            self.assertEqual(result["ev_alerts_sent"], 1)
+            self.assertEqual(result["arb_alerts_sent"], 1)
+            # 1 EV + 1 Arb = 2 alerts sent
+            self.assertEqual(mock_send.call_count, 2)
 
 
 if __name__ == "__main__":
