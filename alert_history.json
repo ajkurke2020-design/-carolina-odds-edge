@@ -14,5 +14,29 @@
   "726307_Total 20.5 (Tampa Bay Buccaneers team)_Over_20.5_ProphetX": {
     "ev": 3.1725188200621757,
     "timestamp": 1794972690.872996
+  },
+  "768009_Spread +11.5_UL - Lafayette_11.5_Novig": {
+    "ev": 9.216440547781513,
+    "timestamp": 1794977314.368343
+  },
+  "696020_Total 234.5_Under_234.5_Novig": {
+    "ev": 4.262698608536597,
+    "timestamp": 1794977314.368343
+  },
+  "768005_Total 165.5_Under_165.5_ProphetX": {
+    "ev": 4.169102194262808,
+    "timestamp": 1794977314.368343
+  },
+  "arb_768009_Spread -11.5_San Francisco_Pinnacle-UL - Lafayette_Novig": {
+    "roi": 2.164,
+    "timestamp": 1794977314.368343
+  },
+  "arb_768009_Spread -9.5_San Francisco_Pinnacle-UL - Lafayette_Novig": {
+    "roi": 1.5859999999999999,
+    "timestamp": 1794977314.368343
+  },
+  "arb_768009_Spread -10.5_San Francisco_Pinnacle-UL - Lafayette_Novig": {
+    "roi": 1.404,
+    "timestamp": 1794977314.368343
   }
 }
