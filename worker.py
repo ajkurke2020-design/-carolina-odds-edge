@@ -4,8 +4,8 @@ Standalone background worker for automated +EV bet and Arbitrage notifications.
 
 Scans active sports via PropLine API, detects +EV opportunities against Pinnacle
 and risk-free arbitrage opportunities across approved books, caches odds data,
-tracks alert history to avoid duplicate notifications, and sends alerts to Telegram.
-Includes automatic multi-key rollover support for PropLine API quotas.
+tracks alert history to avoid duplicate notifications, sends alerts to Telegram,
+welcomes new members with educational onboarding guides, and supports backup API keys.
 """
 
 from __future__ import annotations
@@ -276,6 +276,7 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
     """
     Format +EV opportunity cleanly with HTML showing:
     Sport, Matchup, Bet/Line, Odds, Sportsbook, Fair Odds, EV%, and Recommended Kelly Units.
+    Omits raw dollar amounts for stakes; displays unit size with clear explanation.
     """
     sport = html.escape(str(opp.get("sport") or "Unknown"))
     matchup = html.escape(str(opp.get("matchup") or "Unknown Matchup"))
@@ -364,11 +365,11 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
     stake = min(float(raw_stake or 0.0), MAX_SINGLE_BET)
     units_str = format_kelly_units(stake)
     if opp.get("flags") and "verify" in str(opp.get("flags")):
-        stake_text = "0u ($0.00 - Flagged for Verification)"
+        stake_text = "0u <i>(Flagged for verification)</i>"
     elif stake > 0:
-        stake_text = f"{units_str} (${stake:.2f})"
+        stake_text = f"{units_str} <i>(1u = 1% of bankroll)</i>"
     else:
-        stake_text = "0u ($0.00)"
+        stake_text = "0u <i>(1u = 1% of bankroll)</i>"
 
     return (
         f"🚨 <b>+EV Bet Opportunity</b> 🚨\n\n"
@@ -444,6 +445,44 @@ def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
     )
 
 
+def format_welcome_guide(greeting_name: str | None = None) -> str:
+    """
+    Comprehensive educational guide for onboarding new Telegram group members,
+    explaining +EV, unit sizing, how to read alerts, and what to expect.
+    """
+    greeting = (
+        f"👋 <b>Welcome to Not Your Bookie Edge, {greeting_name}!</b> 🎯"
+        if greeting_name
+        else "👋 <b>Welcome to Not Your Bookie Edge!</b> 🎯"
+    )
+    return (
+        f"{greeting}\n\n"
+        f"Here is your quick-start guide on how our automated mathematical alerts work and how to maximize your profits:\n\n"
+        f"📚 <b>Need-to-Know Terms:</b>\n\n"
+        f"• <b>What is +EV (Expected Value)?</b>\n"
+        f"We scan thousands of real-time odds against Pinnacle (the sharpest bookmaker in the world). When a sportsbook misprices a line, we get a mathematical edge over the house. Over time, betting +EV is mathematically proven to generate profit.\n\n"
+        f"• <b>What is a 'Unit' (u)?</b>\n"
+        f"A unit is a standardized bet size based on <b>your own bankroll</b>:\n"
+        f"👉 <b>1 unit (1u) = 1% of your total betting bankroll.</b>\n"
+        f"<i>Examples:</i>\n"
+        f"• $500 bankroll ➔ 1u = $5 (0.5u = $2.50)\n"
+        f"• $1,000 bankroll ➔ 1u = $10 (0.5u = $5.00)\n"
+        f"• $5,000 bankroll ➔ 1u = $50 (0.5u = $25.00)\n"
+        f"Never risk more than the recommended unit size to protect against normal variance.\n\n"
+        f"• <b>What is an Arbitrage Alert (⚡)?</b>\n"
+        f"A 100% risk-free trade where two sportsbooks disagree on odds. You bet both sides and lock in a guaranteed profit before the game even starts.\n\n"
+        f"• <b>Fair Odds:</b>\n"
+        f"The true 'no-vig' probability. As long as your book offers odds equal to or better than Fair Odds, the bet has positive value.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📖 <b>How to Read Alerts:</b>\n"
+        f"1. <b>Bet / Line:</b> The exact wager to select (Spread, Total, Moneyline).\n"
+        f"2. <b>Sportsbook:</b> The app offering the mispriced line (DraftKings, FanDuel, etc.).\n"
+        f"3. <b>Odds:</b> The price to take. If the odds drop below the alert price, skip it.\n"
+        f"4. <b>Recommended Stake:</b> The exact unit size to place (e.g., 0.5u, 1u).\n\n"
+        f"⚡ <b>Pro-Tip:</b> Lines move fast! When an alert drops, place your wager promptly before the sportsbook adjusts the price."
+    )
+
+
 def send_telegram_message(
     bot_token: str, chat_id: str, message: str, timeout: int = 15
 ) -> bool:
@@ -472,6 +511,60 @@ def send_telegram_message(
         return False
     finally:
         session.close()
+
+
+def check_and_welcome_new_members(bot_token: str, chat_id: str) -> int:
+    """
+    Check for new members who joined the Telegram group and send an onboarding guide.
+    """
+    if not bot_token or not chat_id:
+        return 0
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+    session = _new_telegram_session()
+    welcomed = 0
+    try:
+        response = session.get(url, params={"timeout": 1, "allowed_updates": ["message"]}, timeout=8)
+        if response.status_code != 200:
+            return 0
+        data = response.json()
+        updates = data.get("result", [])
+        if not updates:
+            return 0
+
+        latest_update_id = None
+        new_member_names = []
+
+        for update in updates:
+            latest_update_id = update.get("update_id")
+            message = update.get("message", {})
+            msg_chat = message.get("chat", {})
+            if str(msg_chat.get("id")) != str(chat_id):
+                continue
+            new_users = message.get("new_chat_members", [])
+            for user in new_users:
+                if user.get("is_bot"):
+                    continue
+                name = user.get("first_name") or user.get("username") or "there"
+                new_member_names.append(html.escape(name))
+
+        # Acknowledge updates by incrementing offset
+        if latest_update_id is not None:
+            session.get(url, params={"offset": latest_update_id + 1, "timeout": 0}, timeout=5)
+
+        if new_member_names:
+            names_text = ", ".join(new_member_names)
+            welcome_text = format_welcome_guide(greeting_name=names_text)
+            success = send_telegram_message(bot_token, chat_id, welcome_text)
+            if success:
+                welcomed = len(new_member_names)
+                print(f"Welcomed {welcomed} new member(s): {names_text}")
+
+    except Exception as error:
+        print(f"Warning: Failed to check for new members: {error}", file=sys.stderr)
+    finally:
+        session.close()
+
+    return welcomed
 
 
 def save_cached_odds(
@@ -578,7 +671,7 @@ def run_worker(
     cache_file: str = CACHED_ODDS_FILE,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Execute one scan-and-alert cycle for +EV and Arbitrage with backup key support."""
+    """Execute one scan-and-alert cycle for +EV and Arbitrage with backup key and member onboarding support."""
     now_utc = datetime.now(timezone.utc)
     now_ts = time.time()
     scan_sports = sports or ACTIVE_SPORTS
@@ -596,6 +689,18 @@ def run_worker(
     print(f"Minimum EV threshold: {min_ev:.1f}% | Min Arb ROI: {min_arb_roi:.1f}% | Max Bet Cap: ${max_bet_cap:.0f}")
     print(f"Configured PropLine API keys available: {len(keys_to_use)}")
 
+    bot_token, chat_id = get_telegram_credentials()
+    telegram_configured = bool(bot_token and chat_id)
+    if not telegram_configured:
+        print(
+            "WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. "
+            "Alerts will be logged to console but not sent to Telegram."
+        )
+
+    # Check for new members who joined and educate them with the onboarding guide
+    if telegram_configured and not dry_run:
+        check_and_welcome_new_members(bot_token, chat_id)
+
     if not keys_to_use:
         print(
             "ERROR: PropLine API key is missing. Set PROPLINE_API_KEY environment variable.",
@@ -607,14 +712,6 @@ def run_worker(
             "ev_alerts_sent": 0,
             "arb_alerts_sent": 0,
         }
-
-    bot_token, chat_id = get_telegram_credentials()
-    telegram_configured = bool(bot_token and chat_id)
-    if not telegram_configured:
-        print(
-            "WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. "
-            "Alerts will be logged to console but not sent to Telegram."
-        )
 
     # 1. Fetch upcoming quotes with automated key rollover
     fetch_result, active_key = fetch_odds_with_fallback(scan_sports, keys_to_use, mode="upcoming")
@@ -785,6 +882,20 @@ def run_worker(
 
 
 def main() -> None:
+    if "--send-guide" in sys.argv or "--welcome" in sys.argv:
+        bot_token, chat_id = get_telegram_credentials()
+        if not bot_token or not chat_id:
+            print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.", file=sys.stderr)
+            sys.exit(1)
+        guide_text = format_welcome_guide()
+        success = send_telegram_message(bot_token, chat_id, guide_text)
+        if success:
+            print("Successfully sent onboarding guide to Telegram group.")
+        else:
+            print("Failed to send onboarding guide to Telegram group.", file=sys.stderr)
+            sys.exit(1)
+        return
+
     dry_run = "--dry-run" in sys.argv
     result = run_worker(dry_run=dry_run)
     if not result.get("success", False):

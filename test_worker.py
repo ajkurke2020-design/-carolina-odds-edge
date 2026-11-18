@@ -13,11 +13,13 @@ from worker import (
     MAX_SINGLE_BET,
     build_alert_key,
     build_arbitrage_alert_key,
+    check_and_welcome_new_members,
     clean_expired_history,
     fetch_odds_with_fallback,
     format_kelly_units,
     format_telegram_alert,
     format_telegram_arbitrage_alert,
+    format_welcome_guide,
     get_api_keys,
     is_game_started,
     load_alert_history,
@@ -156,12 +158,51 @@ class WorkerTests(unittest.TestCase):
         text = format_telegram_alert(opp)
         self.assertIn("Sport:</b> NBA", text)
         self.assertIn("Matchup:</b> Boston Celtics vs Dallas Mavericks", text)
-        self.assertIn("Bet / Line:</b> Boston Celtics -4.5", text)
+        self.assertIn("Bet / Line:</b> Boston Celtics -4.5 (Spread)", text)
         self.assertIn("Odds:</b> -110 (1.91)", text)
         self.assertIn("Sportsbook:</b> DraftKings", text)
         self.assertIn("Fair Odds:</b>", text)
         self.assertIn("EV%:</b> +5.05%", text)
-        self.assertIn("Recommended Stake:</b> 30u ($300.00)", text)
+        self.assertIn("Recommended Stake:</b> 30u <i>(1u = 1% of bankroll)</i>", text)
+        self.assertNotIn("($300.00)", text)
+
+    def test_format_welcome_guide_content(self):
+        guide = format_welcome_guide("Alex")
+        self.assertIn("Welcome to Not Your Bookie Edge, Alex!", guide)
+        self.assertIn("What is +EV (Expected Value)?", guide)
+        self.assertIn("What is a 'Unit' (u)?", guide)
+        self.assertIn("1 unit (1u) = 1% of your total betting bankroll.", guide)
+        self.assertIn("What is an Arbitrage Alert", guide)
+        self.assertIn("How to Read Alerts:", guide)
+        self.assertIn("Pro-Tip:", guide)
+
+    def test_check_and_welcome_new_members(self):
+        with patch("worker._new_telegram_session") as mock_session_factory:
+            mock_session = MagicMock()
+            mock_session.get.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {
+                    "result": [
+                        {
+                            "update_id": 1001,
+                            "message": {
+                                "chat": {"id": 12345},
+                                "new_chat_members": [
+                                    {"id": 999, "first_name": "Jordan", "is_bot": False}
+                                ],
+                            },
+                        }
+                    ]
+                },
+            )
+            mock_session.post.return_value = MagicMock(status_code=200)
+            mock_session_factory.return_value = mock_session
+
+            welcomed = check_and_welcome_new_members("fake_token", "12345")
+            self.assertEqual(welcomed, 1)
+            mock_session.post.assert_called_once()
+            call_kwargs = mock_session.post.call_args[1]
+            self.assertIn("Jordan", call_kwargs["json"]["text"])
 
     def test_format_telegram_arbitrage_alert(self):
         arb = {
