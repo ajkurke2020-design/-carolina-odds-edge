@@ -1,0 +1,47 @@
+name: EV Bet Alerts
+
+on:
+  schedule:
+    # Every 10 minutes between 8:00 AM and 2:00 AM EST (13:00 - 06:00 UTC)
+    - cron: '*/10 13-23,0-6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan-and-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run EV alert worker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY || secrets.PROP_LINE_API_KEY || secrets.API_KEY }}
+        run: |
+          python worker.py
+
+      - name: Commit and push changes if updated
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          [ -f alert_history.json ] && git add alert_history.json
+          [ -f cached_odds.json ] && git add cached_odds.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update alert history and cached odds [skip ci]"
+            git push
+          fi
