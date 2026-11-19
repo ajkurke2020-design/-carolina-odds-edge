@@ -42,5 +42,25 @@
   "725690_Total 21.5 (Los Angeles Chargers team)_Under_21.5_ProphetX": {
     "ev": 4.410408840704627,
     "timestamp": 1795047741.4191382
+  },
+  "721358_Total 16.5 (Old Dominion team)_Over_16.5_ProphetX": {
+    "ev": 4.458588082147297,
+    "timestamp": 1795048841.8471165
+  },
+  "720978_Total 32.5 (Cincinnati team)_Over_32.5_ProphetX": {
+    "ev": 3.851459924343259,
+    "timestamp": 1795048841.8471165
+  },
+  "720663_Total 34.5 (Memphis team)_Over_34.5_ProphetX": {
+    "ev": 3.840094252519066,
+    "timestamp": 1795048841.8471165
+  },
+  "arb_696022_Spread -20.5_Los Angeles Lakers_Novig-Utah Jazz_BetMGM": {
+    "roi": 1.94,
+    "timestamp": 1795048841.8471165
+  },
+  "arb_697550_Total 214.5_Over_BetMGM-Under_Novig": {
+    "roi": 1.36,
+    "timestamp": 1795048841.8471165
   }
 }
