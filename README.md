@@ -167,12 +167,18 @@ $20.00 in profit.
   type, period, team scope, and selection.
 - Arbitrage chooses the best compatible price pair among selected venues in the
   same event, market, and period. It requires exactly two outcomes, different
-  venues for the two legs, and opposite points for spreads. Pinnacle is a
+  venues for the two legs, and opposite signed points that sum to zero on the
+  same absolute spread line (for example Home +4.5 against Away -4.5). Alternate
+  lines that quote the same sign for both teams are separate wagers, not
+  opposite sides, and are never paired. Three-way moneylines (including a draw)
+  are ignored even when the draw quote is missing, and totals must be the same
+  line's Over and Under. Pinnacle is a
   reference only and is excluded from every arbitrage leg, even if a feed
   payload or manual input includes it. Player props match on event, market,
   player (ID, or normalized name when the ID is missing), and identical line;
-  selections must be Over and Under, and one-way milestone outcomes such as
-  `30+` are ignored. Arbitrage is filtered by a $20.00 minimum guaranteed
+  props without any player identity are ignored, selections must be Over and
+  Under, and one-way milestone outcomes such as `30+` are ignored. Arbitrage is
+  filtered by a $20.00 minimum guaranteed
   profit at the configured stake: after whole-dollar rounding, the opportunity
   is shown only when the minimum leg payout still clears the total stake by at
   least $20.00. The worker additionally keeps each leg at or below $300.

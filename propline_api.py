@@ -380,7 +380,12 @@ def _market_team(market: dict[str, Any], outcome: dict[str, Any]) -> str | None:
 
 
 def _market_identity(
-    market_key: str, point: Any, team: str | None = None, player: str | None = None
+    market_key: str,
+    point: Any,
+    team: str | None = None,
+    player: str | None = None,
+    *,
+    signed: bool = False,
 ) -> str:
     if point is None:
         identity = market_key
@@ -392,7 +397,12 @@ def _market_identity(
         if not math.isfinite(number):
             identity = market_key
         else:
-            if market_key == "spreads":
+            # Spreads are grouped by absolute line so the two sides of the same
+            # number (e.g. Home +4.5 and Away -4.5) live in one market. The
+            # signed form is used for per-book update tracking and deduplication
+            # so a book's alternate lines for the same team at +X and -X do not
+            # overwrite each other.
+            if market_key == "spreads" and not signed:
                 number = abs(number)
             identity = f"{market_key}:{number:g}"
     if market_key == "totals" and team:
@@ -538,19 +548,23 @@ def parse_odds_payload(
                         group_key = _market_identity(
                             market_key, outcome.get("point"), None, player_scope
                         )
+                        instance_key = group_key
                     else:
                         team = _market_team(market, outcome)
                         selection = str(outcome.get("name", ""))
                         group_key = _market_identity(
                             market_key, outcome.get("point"), team
                         )
+                        instance_key = _market_identity(
+                            market_key, outcome.get("point"), team, signed=True
+                        )
                     period = str(market.get("period") or "")
                     event_markets.setdefault(
-                        (bookmaker_key, group_key, period), set()
+                        (bookmaker_key, instance_key, period), set()
                     ).add(str(selection))
                     update = _parse_timestamp(market.get("last_update"))
                     if update is not None:
-                        update_key = (bookmaker_key, group_key, period)
+                        update_key = (bookmaker_key, instance_key, period)
                         latest_market_updates[update_key] = max(
                             update, latest_market_updates.get(update_key, update)
                         )
@@ -595,6 +609,7 @@ def parse_odds_payload(
                         group_key = _market_identity(
                             market_key, outcome.get("point"), None, player_scope
                         )
+                        instance_key = group_key
                     else:
                         selection = outcome.get("name")
                         if not isinstance(selection, str):
@@ -604,15 +619,18 @@ def parse_odds_payload(
                         group_key = _market_identity(
                             market_key, outcome.get("point"), team
                         )
+                        instance_key = _market_identity(
+                            market_key, outcome.get("point"), team, signed=True
+                        )
 
                     point = outcome.get("point")
                     period = str(market.get("period") or "")
                     observed = event_markets.get(
-                        (bookmaker_key, group_key, period), set()
+                        (bookmaker_key, instance_key, period), set()
                     )
                     update = _parse_timestamp(market.get("last_update"))
                     latest_update = latest_market_updates.get(
-                        (bookmaker_key, group_key, period)
+                        (bookmaker_key, instance_key, period)
                     )
                     if latest_update is not None and update != latest_update:
                         continue
@@ -698,7 +716,7 @@ def parse_odds_payload(
                     identity = (
                         str(event_id),
                         bookmaker_key,
-                        group_key,
+                        instance_key,
                         period,
                         selection,
                     )

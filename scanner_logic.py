@@ -1398,23 +1398,16 @@ def find_arbitrage_opportunities(
     ), selection_quotes in markets.items():
         if len(selection_quotes) != 2:
             continue
+        base_market_type = str(market_key).split(":", 1)[0].casefold()
         player_prop = bool(player_scope) or is_player_prop_market_key(
-            market_key[2]
+            market_key
         )
-        expected_outcomes = next(
-            (
-                set(quote["expected_outcomes"])
-                for quotes_for_selection in selection_quotes.values()
-                for quote in quotes_for_selection
-                if quote.get("expected_outcomes")
-            ),
-            None,
-        )
-        if expected_outcomes is not None and (
-            len(expected_outcomes) != 2 or set(selection_quotes) != expected_outcomes
-        ):
-            continue
         if player_prop:
+            # Props require the same player's Over and Under at one line.
+            # Milestone outcomes can share the feed market, so do not let their
+            # declared outcome list block a valid Over/Under pair.
+            if not player_scope:
+                continue
             if set(selection_quotes) != {"Over", "Under"}:
                 continue
             points = [
@@ -1428,6 +1421,42 @@ def find_arbitrage_opportunities(
                 continue
             if player_point is None:
                 continue
+            expected_outcomes = set(selection_quotes)
+        else:
+            group_quotes = [
+                quote
+                for quotes_for_selection in selection_quotes.values()
+                for quote in quotes_for_selection
+            ]
+            declared_outcomes = [
+                set(quote["expected_outcomes"])
+                for quote in group_quotes
+                if quote.get("expected_outcomes")
+            ]
+            # Every book that declares its outcomes must describe the same
+            # two-way market. This rejects three-way moneylines (which include
+            # a draw even if the draw quote is missing from this snapshot).
+            if any(
+                len(outcomes) != 2 or outcomes != set(selection_quotes)
+                for outcomes in declared_outcomes
+            ):
+                continue
+            expected_outcomes = (
+                declared_outcomes[0] if declared_outcomes else None
+            )
+            if base_market_type == "totals":
+                # Totals require the same line's Over and Under.
+                if set(selection_quotes) != {"Over", "Under"}:
+                    continue
+            elif base_market_type != "spreads":
+                # Moneyline must be a true two-way market. A draw selection
+                # means this is a three-way market and cannot be covered by
+                # two legs.
+                if any(
+                    str(selection).strip().casefold() == "draw"
+                    for selection in selection_quotes
+                ):
+                    continue
 
         selection_names = list(expected_outcomes or selection_quotes)
         first_quotes = selection_quotes[selection_names[0]]
@@ -1444,7 +1473,7 @@ def find_arbitrage_opportunities(
                     == str(second_quote["sportsbook"]).casefold()
                 ):
                     continue
-                market_type_text = str(market_key[2])
+                market_type_text = str(market_key)
                 if market_type_text.startswith("spreads"):
                     if not _compatible_market_lines(
                         market_type_text,

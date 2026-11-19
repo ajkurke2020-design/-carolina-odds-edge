@@ -955,6 +955,151 @@ class PlayerPropAndArbitrageSafetyTests(unittest.TestCase):
             [],
         )
 
+    def test_same_signed_spread_points_never_form_an_arbitrage(self):
+        # Both venues quote -13.5 for their own team. Those are two separate
+        # "team covers -13.5" bets, not opposite sides of one line, so the
+        # apparently huge edge is a phantom.
+        quotes = [
+            quote(
+                "DraftKings",
+                "Home",
+                21.0,
+                market_key="spreads:13.5",
+                point=-13.5,
+            ),
+            quote(
+                "FanDuel",
+                "Away",
+                8.33,
+                market_key="spreads:13.5",
+                point=-13.5,
+            ),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(quotes, 500, rounding_step=1, now=NOW),
+            [],
+        )
+
+    def test_opposite_signed_spread_points_form_an_arbitrage(self):
+        quotes = [
+            quote(
+                "DraftKings",
+                "Away",
+                2.2,
+                market_key="spreads:4.5",
+                point=-4.5,
+            ),
+            quote(
+                "FanDuel",
+                "Home",
+                2.05,
+                market_key="spreads:4.5",
+                point=4.5,
+            ),
+        ]
+        opportunities = find_arbitrage_opportunities(
+            quotes, 500, rounding_step=1, now=NOW
+        )
+        self.assertEqual(len(opportunities), 1)
+        arb = opportunities[0]
+        self.assertEqual(
+            {float(leg["line"]) for leg in arb["legs"]},
+            {-4.5, 4.5},
+        )
+        self.assertAlmostEqual(
+            sum(float(leg["line"]) for leg in arb["legs"]), 0.0
+        )
+
+    def test_three_way_moneyline_never_forms_a_two_leg_arbitrage(self):
+        # One venue reports a two-way market while another reports a three-way
+        # market. The draw still exists, so Home + Away does not cover it even
+        # when the draw quote is absent from this snapshot.
+        quotes = [
+            quote(
+                "DraftKings",
+                "Home",
+                2.2,
+                expected=["Home", "Away"],
+            ),
+            quote(
+                "FanDuel",
+                "Away",
+                2.2,
+                expected=["Home", "Away", "Draw"],
+            ),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(quotes, 500, rounding_step=1, now=NOW),
+            [],
+        )
+
+    def test_totals_require_over_and_under_at_the_same_line(self):
+        over = quote(
+            "DraftKings",
+            "Over",
+            2.2,
+            market_key="totals:44.5",
+            point=44.5,
+            expected=["Over", "Under"],
+        )
+        under = quote(
+            "FanDuel",
+            "Under",
+            2.2,
+            market_key="totals:44.5",
+            point=44.5,
+            expected=["Over", "Under"],
+        )
+        opportunities = find_arbitrage_opportunities(
+            [over, under], 500, rounding_step=1, now=NOW
+        )
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(
+            {leg["selection"] for leg in opportunities[0]["legs"]},
+            {"Over", "Under"},
+        )
+
+        # Two non-opposite selections at the same totals line are not a market,
+        # even when the feed omits expected_outcomes entirely.
+        unlabeled_over = {
+            key: value
+            for key, value in over.items()
+            if key != "expected_outcomes"
+        }
+        wrong_selection = quote(
+            "FanDuel",
+            "Home",
+            2.2,
+            market_key="totals:44.5",
+            point=44.5,
+        )
+        wrong_selection.pop("expected_outcomes", None)
+        self.assertEqual(
+            find_arbitrage_opportunities(
+                [unlabeled_over, wrong_selection],
+                500,
+                rounding_step=1,
+                now=NOW,
+            ),
+            [],
+        )
+
+    def test_player_prop_arbitrage_requires_player_identity(self):
+        # Without an ID or name both quotes share an empty player scope and
+        # could otherwise be paired as if they were the same player.
+        over = prop_quote(
+            "DraftKings", "Over", 2.2, player_id=None, player_name=None
+        )
+        under = prop_quote(
+            "FanDuel", "Under", 2.2, player_id=None, player_name=None
+        )
+        self.assertEqual(
+            find_arbitrage_opportunities(
+                [over, under], 500, rounding_step=1, now=NOW
+            ),
+            [],
+        )
+
     def test_arbitrage_requires_at_least_twenty_profit_at_the_stake(self):
         # 2.5/1.7 at a $100 stake guarantees about $1.20, below the $20 floor.
         low_profit = [

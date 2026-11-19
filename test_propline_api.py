@@ -192,6 +192,61 @@ class PropLineApiTests(unittest.TestCase):
         self.assertEqual(quotes[2]["expected_outcomes"], ["Over", "Under"])
         self.assertAlmostEqual(quotes[0]["odds_decimal"], 1.9090909)
 
+    def test_parser_keeps_signed_spread_sides_for_the_same_team(self):
+        # A book can list both Home +4.5 and Home -4.5 as alternate lines. They
+        # are different wagers and must not collapse into one quote during
+        # deduplication, or the surviving side can pair with the wrong number.
+        events = [
+            {
+                "id": "event-signed-spread",
+                "home_team": "Home",
+                "away_team": "Away",
+                "bookmakers": [
+                    {
+                        "key": "draftkings",
+                        "markets": [
+                            {
+                                "key": "spreads",
+                                "outcomes": [
+                                    {
+                                        "name": "Home",
+                                        "side": "home",
+                                        "price": -110,
+                                        "point": 4.5,
+                                    },
+                                    {
+                                        "name": "Away",
+                                        "side": "away",
+                                        "price": -110,
+                                        "point": -4.5,
+                                    },
+                                    {
+                                        "name": "Home",
+                                        "side": "home",
+                                        "price": 320,
+                                        "point": -4.5,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        quotes = parse_odds_payload(events, "NFL")
+
+        self.assertEqual(len(quotes), 3)
+        home_points = sorted(
+            float(item["point"])
+            for item in quotes
+            if item["selection"] == "Home"
+        )
+        self.assertEqual(home_points, [-4.5, 4.5])
+        self.assertTrue(
+            all(item["market_key"] == "spreads:4.5" for item in quotes)
+        )
+
     def test_parser_keeps_game_and_team_totals_separate(self):
         events = [
             {
