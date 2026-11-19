@@ -1,5 +1,9 @@
+import hashlib
+import json
 import math
+import os
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -20,8 +24,27 @@ from urllib3.util import connection as urllib3_connection
 from scanner_config import CONFIG
 
 API_BASE_URL = "https://api.prop-line.com/v1"
-API_MARKETS = "h2h,spreads,totals"
+GAME_MARKETS = ("h2h", "spreads", "totals")
+API_MARKETS = ",".join(GAME_MARKETS)
 EASTERN = ZoneInfo("America/New_York")
+
+QUOTA_HEADERS = (
+    "X-Daily-Remaining",
+    "X-Daily-Used",
+    "X-Daily-Reset",
+    "X-Daily-Limit",
+)
+
+PLAYER_PROP_LABELS = {
+    "player_points": "Player Points",
+    "player_rebounds": "Player Rebounds",
+    "player_assists": "Player Assists",
+    "player_pass_yds": "Passing Yards",
+    "player_rush_yds": "Rushing Yards",
+    "player_reception_yds": "Receiving Yards",
+}
+
+_QUOTA_LOCK = threading.Lock()
 
 
 class _IPv4HTTPSConnection(HTTPSConnection):
@@ -91,6 +114,253 @@ APPROVED_BOOKMAKERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# API key rotation & quota state
+# ---------------------------------------------------------------------------
+
+
+def _key_fingerprint(api_key: str) -> str:
+    """Stable, non-reversible identifier so raw keys are never persisted."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+def load_api_key_pair() -> tuple[str, str]:
+    """Load the two rotating PropLine keys, falling back to the legacy key."""
+    key_1 = os.getenv("PROPLINE_API_KEY_1", "").strip()
+    key_2 = os.getenv("PROPLINE_API_KEY_2", "").strip()
+    legacy = os.getenv("PROPLINE_API_KEY", "").strip()
+
+    if not key_1:
+        key_1 = legacy
+    if not key_2 and legacy and legacy != key_1:
+        key_2 = legacy
+    return key_1, key_2
+
+
+def get_rotating_api_keys(now: datetime | None = None) -> list[str]:
+    """
+    Return the configured keys with the UTC half-day primary first.
+
+    PropLine resets at 00:00 UTC. Key 1 is primary from 00:00-11:59 UTC and
+    Key 2 is primary from 12:00-23:59 UTC.
+    """
+    key_1, key_2 = load_api_key_pair()
+    keys = [key for key in (key_1, key_2) if key]
+    if len(keys) < 2:
+        return keys
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    hour = current.astimezone(timezone.utc).hour
+    return [key_2, key_1] if hour >= 12 else [key_1, key_2]
+
+
+def select_primary_api_key(now: datetime | None = None) -> str:
+    keys = get_rotating_api_keys(now)
+    return keys[0] if keys else ""
+
+
+def parse_quota_headers(headers: Any) -> dict[str, str]:
+    """Extract the daily quota headers PropLine returns on every response."""
+    if not headers:
+        return {}
+    quota: dict[str, str] = {}
+    for header in QUOTA_HEADERS:
+        try:
+            value = headers.get(header)
+        except AttributeError:
+            value = None
+        if value is not None:
+            quota[header] = str(value)
+    return quota
+
+
+def _quota_state_path(path: str | None = None) -> str:
+    return path or CONFIG.quota_state_file
+
+
+def load_quota_state(path: str | None = None) -> dict[str, Any]:
+    state_path = _quota_state_path(path)
+    if not os.path.exists(state_path):
+        return {"keys": {}}
+    try:
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (OSError, ValueError):
+        return {"keys": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("keys"), dict):
+        return {"keys": {}}
+    return state
+
+
+def save_quota_state(state: dict[str, Any], path: str | None = None) -> None:
+    """Atomically persist quota state (write .tmp, then os.replace)."""
+    state_path = _quota_state_path(path)
+    directory = os.path.dirname(os.path.abspath(state_path))
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{state_path}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file, indent=2)
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary_path, state_path)
+    except OSError:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def record_quota(
+    api_key: str,
+    quota: dict[str, str] | None,
+    path: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Persist the latest observed quota headers for one key."""
+    if not api_key or not quota:
+        return
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    fingerprint = _key_fingerprint(api_key)
+    with _QUOTA_LOCK:
+        state = load_quota_state(path)
+        entry = state.setdefault("keys", {}).setdefault(fingerprint, {})
+        entry["headers"] = dict(quota)
+        entry["updated_at"] = current.astimezone(timezone.utc).isoformat()
+        if "X-Daily-Remaining" in quota:
+            try:
+                entry["remaining"] = int(quota["X-Daily-Remaining"])
+            except (TypeError, ValueError):
+                pass
+        if "X-Daily-Used" in quota:
+            try:
+                entry["used"] = int(quota["X-Daily-Used"])
+            except (TypeError, ValueError):
+                pass
+        if "X-Daily-Reset" in quota:
+            entry["reset"] = quota["X-Daily-Reset"]
+        if "X-Daily-Limit" in quota:
+            try:
+                entry["limit"] = int(quota["X-Daily-Limit"])
+            except (TypeError, ValueError):
+                pass
+        try:
+            save_quota_state(state, path)
+        except OSError:
+            # Quota bookkeeping must never take down a scan.
+            pass
+
+
+def remaining_quota_for_key(
+    api_key: str, path: str | None = None
+) -> int | None:
+    if not api_key:
+        return None
+    entry = load_quota_state(path).get("keys", {}).get(_key_fingerprint(api_key))
+    if not isinstance(entry, dict):
+        return None
+    try:
+        return int(entry.get("remaining"))
+    except (TypeError, ValueError):
+        return None
+
+
+def select_api_keys(
+    now: datetime | None = None,
+    quota_state_file: str | None = None,
+    failover_threshold: int = CONFIG.quota_failover_threshold,
+) -> list[str]:
+    """
+    Return rotating keys with the secondary promoted when the primary is low.
+
+    The persisted state is checked before a scan, so an active key below the
+    failover threshold never becomes the primary for that scan.
+    """
+    keys = get_rotating_api_keys(now)
+    if len(keys) < 2:
+        return keys
+    remaining = remaining_quota_for_key(keys[0], quota_state_file)
+    if remaining is not None and remaining < failover_threshold:
+        return [keys[1], keys[0]]
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# Market helpers
+# ---------------------------------------------------------------------------
+
+
+def sport_markets(sport_label: str) -> str:
+    """Bulk market list for a sport, including configured player props."""
+    sport_key = SPORT_CONFIG[sport_label]
+    player_markets = CONFIG.player_prop_markets_for_sport(sport_key)
+    return ",".join([*GAME_MARKETS, *player_markets])
+
+
+def is_player_prop_market(market_key: Any) -> bool:
+    return str(market_key or "").split(":", 1)[0].casefold().startswith("player_")
+
+
+def _supported_market(market_key: Any) -> bool:
+    if not isinstance(market_key, str):
+        return False
+    base = market_key.split(":", 1)[0].casefold()
+    return base in GAME_MARKETS or base.startswith("player_")
+
+
+def _normalize_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).casefold()
+
+
+def _player_scope(player_id: Any, player_name: Any) -> str:
+    if player_id is not None and str(player_id).strip():
+        return f"id:{str(player_id).strip()}"
+    normalized = _normalize_name(player_name)
+    return f"name:{normalized}" if normalized else ""
+
+
+def _player_outcome(
+    market: dict[str, Any], outcome: dict[str, Any]
+) -> tuple[str | None, Any, str | None]:
+    """
+    Return (selection, player_id, player_name) for a player prop outcome.
+
+    PropLine (and Odds API-compatible feeds) usually put Over/Under in
+    ``name`` and the player in ``description``. Some providers reverse those
+    fields, so both shapes are normalized here.
+    """
+    player_id = outcome.get("player_id") or market.get("player_id")
+    raw_name = outcome.get("name")
+    raw_description = outcome.get("description") or outcome.get("player_name")
+
+    name_text = str(raw_name).strip() if raw_name is not None else ""
+    description_text = (
+        str(raw_description).strip() if raw_description is not None else ""
+    )
+    over_under = {"over": "Over", "under": "Under"}
+
+    if name_text.casefold() in over_under:
+        selection = over_under[name_text.casefold()]
+        player_name = description_text or None
+    elif description_text.casefold() in over_under:
+        selection = over_under[description_text.casefold()]
+        player_name = name_text or None
+    else:
+        selection = name_text or None
+        player_name = description_text or None
+
+    if player_id is not None and not str(player_id).strip():
+        player_id = None
+    return selection, player_id, player_name
+
+
 def american_to_decimal(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -109,7 +379,9 @@ def _market_team(market: dict[str, Any], outcome: dict[str, Any]) -> str | None:
     return team.strip()
 
 
-def _market_identity(market_key: str, point: Any, team: str | None = None) -> str:
+def _market_identity(
+    market_key: str, point: Any, team: str | None = None, player: str | None = None
+) -> str:
     if point is None:
         identity = market_key
     else:
@@ -125,10 +397,22 @@ def _market_identity(market_key: str, point: Any, team: str | None = None) -> st
             identity = f"{market_key}:{number:g}"
     if market_key == "totals" and team:
         identity += f":team:{team.casefold()}"
+    if player:
+        identity += f":player:{player}"
     return identity
 
 
-def _market_label(market_key: str, point: Any, team: str | None = None) -> str:
+def _market_label(
+    market_key: str,
+    point: Any,
+    team: str | None = None,
+    player_name: str | None = None,
+) -> str:
+    if market_key.startswith("player_"):
+        return PLAYER_PROP_LABELS.get(
+            market_key, market_key.replace("_", " ").title()
+        )
+
     if point is None:
         label = {"h2h": "Moneyline", "spreads": "Spread", "totals": "Total"}.get(
             market_key, market_key.replace("_", " ").title()
@@ -238,21 +522,32 @@ def parse_odds_payload(
                 if not isinstance(market, dict):
                     continue
                 market_key = market.get("key")
-                if market_key not in {"h2h", "spreads", "totals"}:
+                if not _supported_market(market_key):
                     continue
+                player_prop = is_player_prop_market(market_key)
                 for outcome in market.get("outcomes", []):
                     if not isinstance(outcome, dict):
                         continue
-                    team = _market_team(market, outcome)
-                    group_key = _market_identity(
-                        market_key, outcome.get("point"), team
-                    )
+                    if player_prop:
+                        selection, player_id, player_name = _player_outcome(
+                            market, outcome
+                        )
+                        if not selection:
+                            continue
+                        player_scope = _player_scope(player_id, player_name)
+                        group_key = _market_identity(
+                            market_key, outcome.get("point"), None, player_scope
+                        )
+                    else:
+                        team = _market_team(market, outcome)
+                        selection = str(outcome.get("name", ""))
+                        group_key = _market_identity(
+                            market_key, outcome.get("point"), team
+                        )
                     period = str(market.get("period") or "")
                     event_markets.setdefault(
                         (bookmaker_key, group_key, period), set()
-                    ).add(
-                        str(outcome.get("name", ""))
-                    )
+                    ).add(str(selection))
                     update = _parse_timestamp(market.get("last_update"))
                     if update is not None:
                         update_key = (bookmaker_key, group_key, period)
@@ -277,19 +572,40 @@ def parse_odds_payload(
                 if not isinstance(market, dict):
                     continue
                 market_key = market.get("key")
-                if market_key not in {"h2h", "spreads", "totals"}:
+                if not _supported_market(market_key):
                     continue
+                player_prop = is_player_prop_market(market_key)
                 for outcome in market.get("outcomes", []):
                     if not isinstance(outcome, dict):
                         continue
-                    selection = outcome.get("name")
                     decimal_odds = american_to_decimal(outcome.get("price"))
-                    if not isinstance(selection, str) or decimal_odds is None:
+                    if decimal_odds is None:
                         continue
 
-                    team = _market_team(market, outcome)
+                    player_id = None
+                    player_name = None
+                    if player_prop:
+                        selection, player_id, player_name = _player_outcome(
+                            market, outcome
+                        )
+                        if not selection:
+                            continue
+                        team = None
+                        player_scope = _player_scope(player_id, player_name)
+                        group_key = _market_identity(
+                            market_key, outcome.get("point"), None, player_scope
+                        )
+                    else:
+                        selection = outcome.get("name")
+                        if not isinstance(selection, str):
+                            continue
+                        team = _market_team(market, outcome)
+                        player_scope = ""
+                        group_key = _market_identity(
+                            market_key, outcome.get("point"), team
+                        )
+
                     point = outcome.get("point")
-                    group_key = _market_identity(market_key, point, team)
                     period = str(market.get("period") or "")
                     observed = event_markets.get(
                         (bookmaker_key, group_key, period), set()
@@ -304,7 +620,16 @@ def parse_odds_payload(
                     if update is not None and last_seen is not None and last_seen < update:
                         continue
 
-                    if market_key in {"h2h", "spreads"}:
+                    if player_prop:
+                        if observed:
+                            expected = (
+                                ["Over", "Under"]
+                                if observed == {"Over", "Under"}
+                                else sorted(observed)
+                            )
+                        else:
+                            expected = ["Over", "Under"]
+                    elif market_key in {"h2h", "spreads"}:
                         side = outcome.get("side")
                         if side == "home":
                             selection = home
@@ -319,19 +644,19 @@ def parse_odds_payload(
                         elif selection.casefold() == "draw":
                             selection = "Draw"
 
-                    if market_key == "h2h":
+                    if not player_prop and market_key == "h2h":
                         expected = [home, away]
                         if any(name.casefold() == "draw" for name in observed):
                             expected.append("Draw")
-                    elif market_key == "spreads":
+                    elif not player_prop and market_key == "spreads":
                         expected = [home, away]
-                    elif market_key == "totals":
+                    elif not player_prop and market_key == "totals":
                         expected = ["Over", "Under"]
                         if selection.casefold() == "over":
                             selection = "Over"
                         elif selection.casefold() == "under":
                             selection = "Under"
-                    else:
+                    elif not player_prop:
                         expected = sorted(observed)
 
                     quote = {
@@ -343,7 +668,9 @@ def parse_odds_payload(
                         "is_live": event.get("live") is True,
                         "completed": event.get("completed") is True,
                         "match_link": "",
-                        "market": _market_label(market_key, point, team),
+                        "market": _market_label(
+                            market_key, point, team, player_name
+                        ),
                         "market_key": group_key,
                         "period": period,
                         "team": team,
@@ -364,6 +691,9 @@ def parse_odds_payload(
                         "last_change_at": outcome.get("last_change_at"),
                         "last_seen_at": outcome.get("last_seen_at"),
                         "book_updated_at": bookmaker.get("last_update"),
+                        "is_player_prop": player_prop,
+                        "player_id": player_id,
+                        "player_name": player_name,
                     }
                     identity = (
                         str(event_id),
@@ -396,7 +726,10 @@ def parse_odds_payload(
 
 
 def _fetch_sport(
-    sport_label: str, mode: str, api_key: str
+    sport_label: str,
+    mode: str,
+    api_key: str,
+    quota_state_file: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"quotes": [], "errors": [], "warnings": [], "quota": {}}
     sport_key = SPORT_CONFIG[sport_label]
@@ -405,7 +738,7 @@ def _fetch_sport(
     try:
         request_args = {
             "params": {
-                "markets": API_MARKETS,
+                "markets": sport_markets(sport_label),
                 "bookmakers": ",".join(
                     [*APPROVED_BOOKMAKERS, CONFIG.pinnacle_bookmaker_key]
                 ),
@@ -438,9 +771,9 @@ def _fetch_sport(
                 session = _new_api_session()
                 time.sleep(0.5 * (2 ** (timeout_retries - 1)))
 
-        for header_name in ("X-Daily-Remaining", "X-Daily-Limit"):
-            if response.headers.get(header_name) is not None:
-                result["quota"][header_name] = response.headers[header_name]
+        result["quota"] = parse_quota_headers(response.headers)
+        if quota_state_file:
+            record_quota(api_key, result["quota"], quota_state_file)
 
         if response.status_code == 401:
             result["errors"].append(
@@ -523,36 +856,59 @@ def _fetch_sport(
     return result
 
 
-def run_api(
-    sports: list[str], mode: str = "upcoming", api_key: str = ""
+def _merge_results(
+    primary: dict[str, Any], secondary: dict[str, Any]
 ) -> dict[str, Any]:
-    if mode not in {"upcoming", "live"}:
-        raise ValueError("Mode must be 'upcoming' or 'live'.")
-    invalid_sports = [sport for sport in sports if sport not in SPORT_CONFIG]
-    if invalid_sports:
-        raise ValueError(f"Unsupported sports: {', '.join(invalid_sports)}")
-    if not sports:
-        return {
-            "quotes": [],
-            "errors": ["Select at least one sport to scan."],
-            "warnings": [],
-            "request_count": 0,
-            "quota": {},
-        }
-    if not api_key.strip():
-        return {
-            "quotes": [],
-            "errors": ["Enter your PropLine API key to scan odds."],
-            "warnings": [],
-            "request_count": 0,
-            "quota": {},
-        }
+    quotes = primary.get("quotes", []) + secondary.get("quotes", [])
+    errors = primary.get("errors", []) + secondary.get("errors", [])
+    warnings = primary.get("warnings", []) + secondary.get("warnings", [])
+    quota: dict[str, str] = {}
+    for source in (primary, secondary):
+        for header, value in source.get("quota", {}).items():
+            if header == "X-Daily-Remaining" and header in quota:
+                try:
+                    value = str(min(int(value), int(quota[header])))
+                except ValueError:
+                    pass
+            quota[header] = value
+    return {
+        "quotes": quotes,
+        "errors": errors,
+        "warnings": warnings,
+        "quota": quota,
+        "request_count": primary.get("request_count", 0)
+        + secondary.get("request_count", 0),
+    }
 
+
+def _result_needs_failover(
+    result: dict[str, Any], failover_threshold: int
+) -> bool:
+    errors = result.get("errors", [])
+    if any("429" in str(error) for error in errors):
+        return True
+    remaining = result.get("quota", {}).get("X-Daily-Remaining")
+    if remaining is None:
+        return False
+    try:
+        return int(remaining) < failover_threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def _run_api_with_key(
+    sports: list[str],
+    mode: str,
+    api_key: str,
+    quota_state_file: str | None,
+) -> dict[str, Any]:
     max_workers = max(1, min(CONFIG.api_max_workers, len(sports)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(
             executor.map(
-                lambda sport: _fetch_sport(sport, mode, api_key),
+                lambda sport: _fetch_sport(
+                    sport, mode, api_key, quota_state_file
+                ),
                 sports,
             )
         )
@@ -576,3 +932,75 @@ def run_api(
         "request_count": len(sports),
         "quota": quota,
     }
+
+
+def run_api(
+    sports: list[str],
+    mode: str = "upcoming",
+    api_key: str = "",
+    api_keys: list[str] | None = None,
+    now: datetime | None = None,
+    quota_state_file: str | None = None,
+    failover_threshold: int = CONFIG.quota_failover_threshold,
+) -> dict[str, Any]:
+    if mode not in {"upcoming", "live"}:
+        raise ValueError("Mode must be 'upcoming' or 'live'.")
+    invalid_sports = [sport for sport in sports if sport not in SPORT_CONFIG]
+    if invalid_sports:
+        raise ValueError(f"Unsupported sports: {', '.join(invalid_sports)}")
+    if not sports:
+        return {
+            "quotes": [],
+            "errors": ["Select at least one sport to scan."],
+            "warnings": [],
+            "request_count": 0,
+            "quota": {},
+        }
+
+    explicit_key = api_key.strip() if isinstance(api_key, str) else ""
+    if api_keys:
+        keys = list(
+            dict.fromkeys(
+                key.strip() for key in api_keys if isinstance(key, str) and key.strip()
+            )
+        )
+    elif explicit_key:
+        keys = [explicit_key]
+    else:
+        keys = select_api_keys(now, quota_state_file, failover_threshold)
+
+    if not keys:
+        return {
+            "quotes": [],
+            "errors": ["Enter your PropLine API key to scan odds."],
+            "warnings": [],
+            "request_count": 0,
+            "quota": {},
+        }
+
+    if quota_state_file is None and not explicit_key and len(keys) > 0:
+        quota_state_file = CONFIG.quota_state_file
+
+    primary_key = keys[0]
+    secondary_key = keys[1] if len(keys) > 1 else None
+    result = _run_api_with_key(
+        sports, mode, primary_key, quota_state_file
+    )
+
+    if (
+        secondary_key
+        and _result_needs_failover(result, failover_threshold)
+    ):
+        secondary_result = _run_api_with_key(
+            sports, mode, secondary_key, quota_state_file
+        )
+        merged = _merge_results(result, secondary_result)
+        merged["failover_used"] = True
+        merged["warnings"] = [
+            *merged["warnings"],
+            "Primary PropLine key was low or rate-limited; failed over to the secondary key for this scan.",
+        ]
+        return merged
+
+    result["failover_used"] = False
+    return result

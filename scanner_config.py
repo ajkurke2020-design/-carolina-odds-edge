@@ -6,6 +6,7 @@ class ScannerConfig:
     pinnacle_bookmaker_key: str = "pinnacle"
     pinnacle_bookmaker_name: str = "Pinnacle"
     devig_method: str = "power"
+    # Interactive board floor. The cron worker uses worker_min_ev_pct below.
     min_ev_pct: float = 2.0
     min_liquidity_dollars: float = 25.0
     verify_ev_pct: float = 15.0
@@ -52,11 +53,56 @@ class ScannerConfig:
         ("FanDuel", 0.0),
     )
 
+    # --- Automated cron worker settings -------------------------------------
+    # Every edge at or above this floor is alerted. There is intentionally no
+    # upper cap: large edges remain visible and alertable (the UI still adds a
+    # "verify" flag above verify_ev_pct).
+    worker_min_ev_pct: float = 3.5
+    worker_max_ev_pct: float | None = None
+    # Arbitrage alerts are shown only when the rounded stakes still guarantee
+    # at least this much profit. This is a floor, not a cap.
+    min_arb_guaranteed_profit_dollars: float = 20.0
+
+    # --- PropLine quota management ------------------------------------------
+    quota_state_file: str = "quota_state.json"
+    quota_failover_threshold: int = 15
+
+    # --- Player props (Arbitrage only; never +EV) ---------------------------
+    # Keyed by PropLine's exact sport key. Only these markets are appended to
+    # the bulk odds request, and the scanner excludes them from +EV/CLV.
+    player_prop_markets_by_sport: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = (
+        (
+            "basketball_nba",
+            ("player_points", "player_rebounds", "player_assists"),
+        ),
+        (
+            "basketball_ncaab",
+            ("player_points", "player_rebounds", "player_assists"),
+        ),
+        (
+            "football_nfl",
+            ("player_pass_yds", "player_rush_yds", "player_reception_yds"),
+        ),
+        (
+            "football_ncaaf",
+            ("player_pass_yds", "player_rush_yds", "player_reception_yds"),
+        ),
+    )
+
     @property
     def effective_line_adjusted_kelly_fraction(self) -> float:
         if self.line_adjusted_kelly_fraction is not None:
             return self.line_adjusted_kelly_fraction
         return self.kelly_fraction / 2
+
+    def player_prop_markets_for_sport(self, sport_key: str) -> tuple[str, ...]:
+        """Return the configured player prop market keys for a PropLine sport key."""
+        for configured_sport, markets in self.player_prop_markets_by_sport:
+            if configured_sport.casefold() == str(sport_key).casefold():
+                return markets
+        return ()
 
 
 CONFIG = ScannerConfig()

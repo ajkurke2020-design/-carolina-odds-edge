@@ -5,6 +5,19 @@ from scanner_config import CONFIG
 from scanner_logic import devig_two_way
 
 
+def is_player_prop_market(market_key: Any) -> bool:
+    """Player props are arbitrage-only and never eligible for +EV sizing."""
+    return str(market_key or "").split(":", 1)[0].casefold().startswith(
+        "player_"
+    )
+
+
+def is_player_prop_quote(quote: dict[str, Any]) -> bool:
+    return quote.get("is_player_prop") is True or is_player_prop_market(
+        quote.get("market_key") or quote.get("market")
+    )
+
+
 def decimal_to_american(decimal: float) -> int:
     if decimal >= 2.0:
         return int(round((decimal - 1.0) * 100))
@@ -82,6 +95,9 @@ def calculate_capped_kelly_stakes(
     raw_stakes = []
     events: dict[tuple[str, str], list[int]] = {}
     for index, quote in enumerate(opportunities):
+        if is_player_prop_quote(quote):
+            raw_stakes.append(0.0)
+            continue
         quote_fraction = quote.get("kelly_fraction", fraction)
         verify_multiplier = (
             verify_stake_multiplier if _has_flag(quote.get("flags"), "verify") else 1.0

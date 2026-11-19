@@ -7,9 +7,14 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from scanner_config import CONFIG
-from scanner_logic import estimate_line_adjusted_probability, expected_value_with_push_pct
+from scanner_logic import (
+    estimate_line_adjusted_probability,
+    expected_value_with_push_pct,
+    is_player_prop_market_key,
+    is_player_prop_quote,
+)
 
-DB_PATH = "data/bets.db"
+DB_PATH = os.getenv("BETS_DB_PATH", os.path.join("data", "bets.db"))
 
 
 def _utc_iso(value: str | None) -> str | None:
@@ -259,6 +264,16 @@ def log_scan(
     pinnacle_snapshots: list[dict],
 ) -> None:
     init_db()
+    # Player props are arbitrage-only. Never persist them as Pinnacle +EV or
+    # CLV snapshots, regardless of what the caller passes in.
+    opportunities = [
+        row for row in opportunities if not is_player_prop_quote(row)
+    ]
+    pinnacle_snapshots = [
+        snapshot
+        for snapshot in pinnacle_snapshots
+        if not is_player_prop_market_key(snapshot.get("market_key"))
+    ]
     observed_utc = _utc_iso(observed_at) or _now_utc_iso()
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.executemany(

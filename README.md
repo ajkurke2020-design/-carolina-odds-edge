@@ -11,6 +11,12 @@ with OddsJam.
 The app uses PropLine's API (`https://api.prop-line.com`) for real-time game
 lines. Each selected sport is fetched with one bulk request for `h2h`, `spreads`,
 and `totals`; the app does not poll automatically or make one request per event.
+For NBA/NCAAB the same request also asks for `player_points`, `player_rebounds`,
+and `player_assists`; for NFL/NCAAF it asks for `player_pass_yds`,
+`player_rush_yds`, and `player_reception_yds`. Player props are used only to find
+arbitrage (Over vs Under at the same line at two venues). They never receive a
+Pinnacle +EV evaluation, are never shown on the +EV board, and are never written
+to the Pinnacle +EV/CLV snapshot tables.
 upcoming scans show events whose kickoff is still in the future in US Eastern
 time, while live scans show events marked live and not completed by the API.
 Event times are displayed in US Eastern time (`America/New_York`). Requests
@@ -39,11 +45,14 @@ streamlit run app.py
 ```
 
 The app opens at `http://localhost:8501`. Add your API key in the sidebar's
-masked **PropLine API key** field, or set `PROPLINE_API_KEY` in the server
-environment before starting the app. A server-configured key is never put in a
-browser-side widget. Get a free key at https://prop-line.com. Select sports and
-schedule, choose betting venues, then click **Scan odds**. The app displays
-remaining daily quota when PropLine includes it in the response headers.
+masked **PropLine API key** field, or configure one or two keys in the server
+environment before starting the app. The cron worker uses the dual-key
+variables `PROPLINE_API_KEY_1` and `PROPLINE_API_KEY_2` and falls back to the
+legacy `PROPLINE_API_KEY` when the numbered keys are absent. A server-configured
+key is never put in a browser-side widget. Get a free key at
+https://prop-line.com. Select sports and schedule, choose betting venues, then
+click **Scan odds**. The app displays remaining daily quota when PropLine
+includes it in the response headers.
 
 The app is locked unless `APP_ACCESS_PASSWORD` is configured with at least 16
 characters. Set a long, random shared passphrase and give it only to people
@@ -66,9 +75,55 @@ The passphrase grants access to the shared app and shared bet database; it does
 not create separate private accounts for each friend. Rotate the passphrase if
 you need to revoke access.
 
-The free tier allows 1,000 requests per day. A scan uses at most one request
-per selected sport (seven if all supported sports are selected). Re-scan only
-when you want a refreshed snapshot; responses are not polled in the background.
+The free tier allows 1,000 requests per day per key. A scan uses at most one
+request per selected sport (seven if all supported sports are selected).
+Re-scan only when you want a refreshed snapshot; responses are not polled in
+the background.
+
+The worker rotates the two keys by UTC half-day: `PROPLINE_API_KEY_1` is primary
+from 00:00-11:59 UTC and `PROPLINE_API_KEY_2` from 12:00-23:59 UTC. It records
+`X-Daily-Remaining`, `X-Daily-Used`, and `X-Daily-Reset` per key (only a
+non-reversible key fingerprint is stored) in `quota_state.json`, and it fails
+over to the other key when the active key reports fewer than 15 requests left
+or returns HTTP 429. Off-season sports with no upcoming/live events in the last
+cached scan are skipped so they do not consume a credit.
+
+## Cron worker
+
+`worker.py` is a standalone one-shot pipeline for a local machine or VPS. It
+reads credentials from the environment or a local `.env` file, makes one bulk
+request per active sport, writes `cached_odds.json` and `alert_history.json`
+atomically (`.tmp` plus `os.replace`), and stores scans/bets in `data/bets.db`
+using SQLite transactions. It does not commit or push to Git, so it can run
+outside version control on a schedule:
+
+```cron
+*/10 * * * * cd /opt/nc-odds-edge && /opt/nc-odds-edge/.venv/bin/python worker.py >> worker.log 2>&1
+```
+
+Required environment variables:
+
+```dotenv
+PROPLINE_API_KEY_1=first-key
+PROPLINE_API_KEY_2=second-key
+TELEGRAM_BOT_TOKEN=123456:bot-token
+TELEGRAM_CHAT_ID=-1001234567890
+```
+
+Optional variables include `WORKER_MIN_EV_PCT` (default `3.5`),
+`WORKER_MAX_EV_PCT` (default uncapped; set to `none` or leave unset),
+`WORKER_OFFSEASON_SPORTS` (comma-separated sport labels), `QUOTA_STATE_FILE`,
+`CACHED_ODDS_FILE`, `ALERT_HISTORY_FILE`, `BETS_DB_PATH`, and
+`DISCORD_WEBHOOK_URL` (optional fallback if Telegram is not configured). Run
+`python worker.py --dry-run` to print alerts without sending them, or
+`python worker.py --send-guide` to post the onboarding message.
+
+The +EV worker floor is 3.5% with no upper cap; large edges stay alertable and
+still carry the existing high-EV "verify" flag. Kelly stakes are reported in
+0.25u increments (1u = 1% of bankroll). Arbitrage alerts show both legs, venue,
+odds, stake, locked payout, and player-prop details when applicable; an
+opportunity is only alerted when its rounded stakes still guarantee at least
+$20.00 in profit.
 
 ## Calculations and scan quality
 
@@ -86,8 +141,10 @@ when you want a refreshed snapshot; responses are not polled in the background.
   quoted range and always enforces the maximum line difference.
 - Pinnacle vig is removed with the power method by default. The shared
   `scanner_config.py` config supports `power`, `shin`, or `multiplicative`,
-  alongside the minimum EV (2%), 60-second quote-age limit, maximum Pinnacle
-  overround (1.06), bankroll/Kelly caps, and line-adjusted controls. Line
+  alongside the interactive board minimum EV (2%), 60-second quote-age limit,
+  maximum Pinnacle overround (1.06), bankroll/Kelly caps, and line-adjusted
+  controls. The automated worker uses a separate 3.5% floor (`worker_min_ev_pct`)
+  and no upper cap (`worker_max_ev_pct = None`). Line
   adjustments default off, with `max_line_diff` set to 1.5 points and their
   Kelly fraction defaulting to half the exact-match fraction. The configured
   football model adds 4- and 2.5-percentage-point adjustments when spreads
@@ -101,7 +158,7 @@ when you want a refreshed snapshot; responses are not polled in the background.
   with a `verify` flag. Each scan reports fetched/kept counts, drop reasons,
   and the minimum, median, and maximum EV. Reported venue liquidity below the
   configured `min_liquidity_dollars` threshold is excluded; the default is
-  `$0`, and quotes without a liquidity value are not filtered.
+  `$25`, and quotes without a liquidity value are not filtered.
 - For non-push lines, EV is `(decimal odds * fair probability - 1) * 100`.
   For whole-number spread/total lines, the model estimates win, lose, and push
   probabilities and uses `win_p * (decimal odds - 1) - lose_p`; a push returns
@@ -110,7 +167,15 @@ when you want a refreshed snapshot; responses are not polled in the background.
   type, period, team scope, and selection.
 - Arbitrage chooses the best compatible price pair among selected venues in the
   same event, market, and period. It requires exactly two outcomes, different
-  venues for the two legs, and opposite points for spreads.
+  venues for the two legs, and opposite points for spreads. Pinnacle is a
+  reference only and is excluded from every arbitrage leg, even if a feed
+  payload or manual input includes it. Player props match on event, market,
+  player (ID, or normalized name when the ID is missing), and identical line;
+  selections must be Over and Under, and one-way milestone outcomes such as
+  `30+` are ignored. Arbitrage is filtered by a $20.00 minimum guaranteed
+  profit at the configured stake: after whole-dollar rounding, the opportunity
+  is shown only when the minimum leg payout still clears the total stake by at
+  least $20.00. The worker additionally keeps each leg at or below $300.
   Quotes without a timestamp or older than `max_quote_age_seconds` are filtered
   by PropLine and again locally before arbitrage calculation. The UI snapshot
   does not auto-refresh; scan again before acting.

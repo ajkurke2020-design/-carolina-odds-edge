@@ -651,15 +651,15 @@ class ExistingScannerBehaviorTests(unittest.TestCase):
         ]
         opportunities = find_arbitrage_opportunities(
             quotes,
-            1000,
+            2000,
             rounding_step=1,
             now=datetime(2026, 11, 13, 10, 1, tzinfo=timezone.utc),
         )
         self.assertEqual(len(opportunities), 1)
         arb = opportunities[0]
-        self.assertEqual(sum(leg["stake"] for leg in arb["legs"]), 1000)
+        self.assertEqual(sum(leg["stake"] for leg in arb["legs"]), 2000)
         self.assertGreater(arb["profit"], 0)
-        self.assertAlmostEqual(arb["profit"], arb["locked_payout"] - 1000)
+        self.assertAlmostEqual(arb["profit"], arb["locked_payout"] - 2000)
         first_leg = next(leg for leg in arb["legs"] if leg["sportsbook"] == "A")
         self.assertEqual(first_leg["odds_american"], 150)
         self.assertEqual(first_leg["liquidity"], 400)
@@ -687,7 +687,7 @@ class ExistingScannerBehaviorTests(unittest.TestCase):
             quote("B", "Away", 2.0, quote_time=NOW.isoformat()),
         ]
         self.assertEqual(
-            len(find_arbitrage_opportunities(fresh_quotes, 100, now=NOW)),
+            len(find_arbitrage_opportunities(fresh_quotes, 200, now=NOW)),
             1,
         )
         fresh_quotes[1].pop("last_seen_at")
@@ -889,6 +889,161 @@ class ReferenceHygieneTests(unittest.TestCase):
     def test_timestamped_quotes_are_not_counted_as_untimestamped(self):
         result = scan_pinnacle_ev(two_way_quotes(book_a=2.5, book_b=2.5), now=NOW)
         self.assertEqual(result["diagnostics"]["untimestamped_quotes_used"], 0)
+
+
+def prop_quote(
+    bookmaker,
+    selection,
+    decimal_odds,
+    *,
+    player_id="player-1",
+    player_name="Player One",
+    point=24.5,
+    market_key="player_points",
+    quote_time=FRESH_QUOTE_TIME,
+):
+    item = quote(
+        bookmaker,
+        selection,
+        decimal_odds,
+        market_key=market_key,
+        point=point,
+        expected=["Over", "Under"],
+        quote_time=quote_time,
+    )
+    item.update(
+        {
+            "is_player_prop": True,
+            "player_id": player_id,
+            "player_name": player_name,
+        }
+    )
+    return item
+
+
+class PlayerPropAndArbitrageSafetyTests(unittest.TestCase):
+    def test_player_props_never_receive_an_ev_evaluation(self):
+        quotes = [
+            prop_quote("Pinnacle", "Over", 1.91),
+            prop_quote("Pinnacle", "Under", 1.91),
+            prop_quote("DraftKings", "Over", 2.5),
+            prop_quote("FanDuel", "Under", 1.80),
+        ]
+        result = scan_pinnacle_ev(quotes, now=NOW)
+
+        self.assertEqual(result["opportunities"], [])
+        self.assertEqual(result["pinnacle_snapshots"], [])
+        self.assertEqual(
+            result["diagnostics"]["dropped"]["player_prop_excluded"], 4
+        )
+        self.assertFalse(
+            any(
+                str(row.get("market_key", "")).startswith("player_")
+                for row in result["opportunities"]
+            )
+        )
+
+    def test_pinnacle_is_never_used_as_an_arbitrage_leg(self):
+        # Pinnacle 2.5 + DraftKings 2.0 would be a 10.9% arbitrage if the
+        # sharp book were allowed to be a leg. It is reference-only.
+        quotes = [
+            quote("Pinnacle", "Home", 2.5),
+            quote("DraftKings", "Away", 2.0),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(quotes, 1000, now=NOW),
+            [],
+        )
+
+    def test_arbitrage_requires_at_least_twenty_profit_at_the_stake(self):
+        # 2.5/1.7 at a $100 stake guarantees about $1.20, below the $20 floor.
+        low_profit = [
+            quote("DraftKings", "Home", 2.5, expected=["Home", "Away"]),
+            quote("FanDuel", "Away", 1.7, expected=["Home", "Away"]),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(
+                low_profit, 100, rounding_step=1, now=NOW
+            ),
+            [],
+        )
+
+        # 2.2/2.2 at $1,000 guarantees about $100, comfortably above the floor.
+        high_profit = [
+            quote("DraftKings", "Home", 2.2, expected=["Home", "Away"]),
+            quote("FanDuel", "Away", 2.2, expected=["Home", "Away"]),
+        ]
+        opportunities = find_arbitrage_opportunities(
+            high_profit, 1000, rounding_step=1, now=NOW
+        )
+        self.assertEqual(len(opportunities), 1)
+        arb = opportunities[0]
+        self.assertEqual(arb["total_stake"], 1000)
+        self.assertGreater(arb["profit"], 20.0)
+        self.assertEqual(arb["min_guaranteed_profit"], 20.0)
+        self.assertGreaterEqual(
+            min(leg["payout"] for leg in arb["legs"]), arb["total_stake"]
+        )
+        self.assertEqual(
+            round(min(leg["payout"] for leg in arb["legs"]) - arb["total_stake"], 2),
+            arb["profit"],
+        )
+
+    def test_player_prop_arbitrage_matches_over_and_under_at_same_line(self):
+        quotes = [
+            prop_quote("DraftKings", "Over", 2.2),
+            prop_quote("FanDuel", "Under", 2.2),
+        ]
+        opportunities = find_arbitrage_opportunities(
+            quotes, 1000, rounding_step=1, now=NOW
+        )
+        self.assertEqual(len(opportunities), 1)
+        arb = opportunities[0]
+        self.assertTrue(arb["is_player_prop"])
+        self.assertEqual(arb["player_name"], "Player One")
+        self.assertEqual({leg["selection"] for leg in arb["legs"]}, {"Over", "Under"})
+        self.assertEqual({float(leg["line"]) for leg in arb["legs"]}, {24.5})
+        self.assertGreaterEqual(arb["profit"], 20.0)
+
+    def test_player_prop_arbitrage_matches_when_one_venue_omits_player_id(self):
+        over = prop_quote(
+            "DraftKings", "Over", 2.2, player_id="player-1", player_name="Player One"
+        )
+        under = prop_quote(
+            "FanDuel", "Under", 2.2, player_id=None, player_name="player one"
+        )
+        opportunities = find_arbitrage_opportunities(
+            [over, under], 1000, rounding_step=1, now=NOW
+        )
+        self.assertEqual(len(opportunities), 1)
+        self.assertTrue(opportunities[0]["is_player_prop"])
+        self.assertEqual(opportunities[0]["player_id"], "player-1")
+
+    def test_player_prop_arbitrage_requires_identical_line_and_two_venues(self):
+        different_points = [
+            prop_quote("DraftKings", "Over", 2.2, point=24.5),
+            prop_quote("FanDuel", "Under", 2.2, point=25.5),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(different_points, 1000, now=NOW), []
+        )
+
+        same_venue = [
+            prop_quote("DraftKings", "Over", 2.2),
+            prop_quote("DraftKings", "Under", 2.2),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(same_venue, 1000, now=NOW), []
+        )
+
+    def test_milestone_only_prop_outcomes_are_ignored(self):
+        quotes = [
+            prop_quote("DraftKings", "30+", 2.2),
+            prop_quote("FanDuel", "Under", 2.2),
+        ]
+        self.assertEqual(
+            find_arbitrage_opportunities(quotes, 1000, now=NOW), []
+        )
 
 
 if __name__ == "__main__":

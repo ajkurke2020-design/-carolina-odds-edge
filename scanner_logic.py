@@ -1,3 +1,4 @@
+import re
 from collections import defaultdict
 from math import ceil, isfinite
 from statistics import NormalDist, median
@@ -5,6 +6,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from scanner_config import CONFIG, DEVIG_METHODS
+
+PLAYER_PROP_PREFIX = "player_"
+_MILESTONE_SELECTION = re.compile(r"^\s*\d+\s*\+\s*$")
 
 
 def _expected_profit_per_dollar(
@@ -520,12 +524,45 @@ def _american_from_decimal(decimal_odds: float) -> int:
 
 
 def _is_pinnacle_quote(quote: dict[str, Any], config=CONFIG) -> bool:
+    bookmaker_key = str(quote.get("bookmaker_key") or "").casefold()
+    sportsbook = str(quote.get("sportsbook") or "").casefold()
     return (
-        str(quote.get("bookmaker_key") or "").casefold()
-        == config.pinnacle_bookmaker_key
-        or str(quote.get("sportsbook") or "").casefold()
-        == config.pinnacle_bookmaker_name.casefold()
+        bookmaker_key == config.pinnacle_bookmaker_key.casefold()
+        or sportsbook == config.pinnacle_bookmaker_name.casefold()
+        or sportsbook == "pinnacle"
+        or "pinnacle" in sportsbook
     )
+
+
+def is_player_prop_market_key(market_key: Any) -> bool:
+    return str(market_key or "").split(":", 1)[0].casefold().startswith(
+        PLAYER_PROP_PREFIX
+    )
+
+
+def is_player_prop_quote(quote: dict[str, Any]) -> bool:
+    if quote.get("is_player_prop") is True:
+        return True
+    return is_player_prop_market_key(
+        quote.get("market_key") or quote.get("market")
+    )
+
+
+def _is_milestone_quote(quote: dict[str, Any]) -> bool:
+    """One-way milestone (e.g. ``30+``) outcomes cannot form a two-way arb."""
+    selection = str(quote.get("selection") or "").strip()
+    market_key = str(quote.get("market_key") or quote.get("market") or "").casefold()
+    if "milestone" in market_key:
+        return True
+    return bool(_MILESTONE_SELECTION.match(selection))
+
+
+def _player_identity(quote: dict[str, Any]) -> str:
+    player_id = quote.get("player_id")
+    if player_id is not None and str(player_id).strip():
+        return f"id:{str(player_id).strip()}"
+    player_name = " ".join(str(quote.get("player_name") or "").split()).casefold()
+    return f"name:{player_name}" if player_name else ""
 
 
 def _event_started(quote: dict[str, Any], now: datetime) -> tuple[bool, bool]:
@@ -623,17 +660,28 @@ def scan_pinnacle_ev(
             "below_min_liquidity": 0,
             "alt_line_duplicate": 0,
             "ambiguous_pinnacle_quote": 0,
+            "player_prop_excluded": 0,
         },
         "rows_kept": 0,
         "untimestamped_quotes_used": 0,
         "ev_pct": {"min": None, "median": None, "max": None},
     }
 
+    # Player props are arbitrage-only. They must never receive a Pinnacle
+    # +EV/CLV evaluation, snapshot, or row.
+    excluded_player_props = [
+        quote for quote in quotes if is_player_prop_quote(quote)
+    ]
+    diagnostics["dropped"]["player_prop_excluded"] = len(excluded_player_props)
+    ev_quotes = [
+        quote for quote in quotes if not is_player_prop_quote(quote)
+    ]
+
     pinnacle_quotes = [
-        quote for quote in quotes if _is_pinnacle_quote(quote, config)
+        quote for quote in ev_quotes if _is_pinnacle_quote(quote, config)
     ]
     bettable_quotes = [
-        quote for quote in quotes if not _is_pinnacle_quote(quote, config)
+        quote for quote in ev_quotes if not _is_pinnacle_quote(quote, config)
     ]
     diagnostics["bettable_quotes"] = len(bettable_quotes)
 
@@ -1136,6 +1184,106 @@ def _allocate_rounded_stakes(
     return max(allocations, key=lambda allocation: (allocation[0], allocation[1]))[2]
 
 
+def _rounded_arbitrage_result(
+    odds: list[float], total_stake: int, rounding_step: int
+) -> tuple[list[int], float, float] | None:
+    """Allocate a whole-dollar total and return (stakes, profit, locked payout)."""
+    if total_stake < 2 or not odds:
+        return None
+    implied_probability_sum = sum(1 / price for price in odds)
+    if (
+        not isfinite(implied_probability_sum)
+        or implied_probability_sum >= 1
+    ):
+        return None
+    raw_stakes = [
+        total_stake * (1 / price) / implied_probability_sum for price in odds
+    ]
+    stakes = _allocate_rounded_stakes(
+        odds, total_stake, rounding_step, raw_stakes
+    )
+    if stakes is None:
+        return None
+    payouts = [stake * price for stake, price in zip(stakes, odds)]
+    profit = round(min(payouts) - total_stake, 2)
+    return stakes, profit, min(payouts)
+
+
+def size_arbitrage_stakes(
+    odds: list[float],
+    total_stake: float,
+    rounding_step: int = 1,
+    max_leg_stake: float | None = None,
+) -> tuple[int, list[int], float, float] | None:
+    """
+    Find the largest whole-dollar total that respects the per-leg limit.
+
+    The total is normally the requested stake. When ``max_leg_stake`` is
+    supplied, the total is scaled down only as far as needed so that every leg
+    stays within the limit. The existing whole-dollar rounding increment is
+    applied by ``_allocate_rounded_stakes`` and the result is re-verified to be
+    positive.
+    """
+    prices = [float(price) for price in odds]
+    if not prices or not all(isfinite(price) and price > 1 for price in prices):
+        return None
+    total = int(total_stake)
+    if total < 2:
+        return None
+    if (
+        isinstance(rounding_step, bool)
+        or not isinstance(rounding_step, int)
+        or rounding_step < 1
+    ):
+        raise ValueError("Rounding step must be a positive whole-dollar amount.")
+    if max_leg_stake is not None and (
+        not isfinite(max_leg_stake) or max_leg_stake < 1
+    ):
+        raise ValueError("Maximum arbitrage leg stake must be at least one dollar.")
+
+    def attempt(candidate: int) -> tuple[str, tuple[list[int], float, float] | None]:
+        outcome = _rounded_arbitrage_result(prices, candidate, rounding_step)
+        if outcome is None:
+            return "low", None
+        stakes, profit, locked_payout = outcome
+        if profit <= 0:
+            return "low", None
+        if max_leg_stake is not None and any(
+            stake > max_leg_stake for stake in stakes
+        ):
+            return "high", None
+        return "ok", (stakes, profit, locked_payout)
+
+    status, outcome = attempt(total)
+    if status == "ok" and outcome is not None:
+        return (total, *outcome)
+
+    best: tuple[int, list[int], float, float] | None = None
+    low, high = 2, total - 1
+    while low <= high:
+        middle = (low + high) // 2
+        status, outcome = attempt(middle)
+        if status == "ok" and outcome is not None:
+            best = (middle, *outcome)
+            low = middle + 1
+        elif status == "high":
+            high = middle - 1
+        else:
+            low = middle + 1
+
+    if best is not None:
+        return best
+
+    # Rounding increments can make the profit function non-monotonic for very
+    # small totals. Fall back to a short descending search to guarantee that a
+    # feasible size is not missed.
+    for candidate in range(total - 1, 1, -1):
+        status, outcome = attempt(candidate)
+        if status == "ok" and outcome is not None:
+            return (candidate, *outcome)
+    return None
+
+
 def find_arbitrage_opportunities(
     quotes: list[dict[str, Any]],
     total_stake: float,
@@ -1159,29 +1307,100 @@ def find_arbitrage_opportunities(
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     now_utc = now_utc.astimezone(timezone.utc)
 
+    # Resolve partial player identifiers across books: prefer player_id, and
+    # fall back to the normalized description only when an outcome lacks one.
+    player_aliases: dict[tuple[Any, ...], str] = {}
+    for quote in quotes:
+        if not is_player_prop_quote(quote):
+            continue
+        player_id = quote.get("player_id")
+        player_name = " ".join(
+            str(quote.get("player_name") or "").split()
+        ).casefold()
+        point = _numeric_point(quote)
+        base_market = str(
+            quote.get("market_key") or quote.get("market") or ""
+        ).split(":", 1)[0]
+        if player_id is not None and str(player_id).strip() and player_name:
+            alias_key = (
+                quote.get("sport", ""),
+                quote.get("event_id", ""),
+                base_market,
+                quote.get("period", ""),
+                point,
+                player_name,
+            )
+            player_aliases[alias_key] = f"id:{str(player_id).strip()}"
+
     markets: dict[
-        tuple[str, str, str, str], dict[str, list[dict[str, Any]]]
+        tuple[str, str, str, str, str, float | None],
+        dict[str, list[dict[str, Any]]],
     ] = defaultdict(lambda: defaultdict(list))
     for quote in quotes:
         if _quote_time(quote) is None or _quote_is_stale(
             quote, now_utc, config.max_quote_age_seconds
         ):
             continue
+        # Pinnacle is strictly a sharp reference and can never be an arb leg.
+        if _is_pinnacle_quote(quote, config):
+            continue
+        if _is_milestone_quote(quote):
+            continue
+        sportsbook = str(quote.get("sportsbook") or "").strip()
+        if not sportsbook:
+            continue
         odds = float(quote["odds_decimal"])
         if not isfinite(odds) or odds <= 1:
             continue
+
+        player_prop = is_player_prop_quote(quote)
+        player_scope = ""
+        point = _numeric_point(quote)
+        market_key_text = str(
+            quote.get("market_key") or quote.get("market") or ""
+        )
+        if player_prop:
+            base_market = market_key_text.split(":", 1)[0]
+            player_name = " ".join(
+                str(quote.get("player_name") or "").split()
+            ).casefold()
+            alias_key = (
+                quote.get("sport", ""),
+                quote.get("event_id", ""),
+                base_market,
+                quote.get("period", ""),
+                point,
+                player_name,
+            )
+            player_scope = player_aliases.get(alias_key) or _player_identity(quote)
+            grouping_market_key = base_market
+        else:
+            grouping_market_key = market_key_text
+
         market_key = (
             quote["sport"],
             quote.get("event_id", quote["matchup"]),
-            quote.get("market_key", quote["market"]),
+            grouping_market_key,
             quote.get("period", ""),
+            player_scope,
+            round(point, 6) if player_prop and point is not None else None,
         )
         markets[market_key][quote["selection"]].append(quote)
 
     opportunities = []
-    for (sport, event_id, market_key, period), selection_quotes in markets.items():
+    for (
+        sport,
+        event_id,
+        market_key,
+        period,
+        player_scope,
+        player_point,
+    ), selection_quotes in markets.items():
         if len(selection_quotes) != 2:
             continue
+        player_prop = bool(player_scope) or is_player_prop_market_key(
+            market_key[2]
+        )
         expected_outcomes = next(
             (
                 set(quote["expected_outcomes"])
@@ -1195,6 +1414,20 @@ def find_arbitrage_opportunities(
             len(expected_outcomes) != 2 or set(selection_quotes) != expected_outcomes
         ):
             continue
+        if player_prop:
+            if set(selection_quotes) != {"Over", "Under"}:
+                continue
+            points = [
+                _numeric_point(item)
+                for quotes_for_selection in selection_quotes.values()
+                for item in quotes_for_selection
+            ]
+            if any(value is None for value in points):
+                continue
+            if max(points) - min(points) > 1e-6:  # type: ignore[type-var]
+                continue
+            if player_point is None:
+                continue
 
         selection_names = list(expected_outcomes or selection_quotes)
         first_quotes = selection_quotes[selection_names[0]]
@@ -1202,11 +1435,19 @@ def find_arbitrage_opportunities(
         compatible_pairs = []
         for first_quote in first_quotes:
             for second_quote in second_quotes:
-                if first_quote["sportsbook"] == second_quote["sportsbook"]:
+                if _is_pinnacle_quote(first_quote, config) or _is_pinnacle_quote(
+                    second_quote, config
+                ):
                     continue
-                if str(market_key).startswith("spreads"):
+                if (
+                    str(first_quote["sportsbook"]).casefold()
+                    == str(second_quote["sportsbook"]).casefold()
+                ):
+                    continue
+                market_type_text = str(market_key[2])
+                if market_type_text.startswith("spreads"):
                     if not _compatible_market_lines(
-                        market_key,
+                        market_type_text,
                         {
                             selection_names[0]: first_quote,
                             selection_names[1]: second_quote,
@@ -1214,10 +1455,10 @@ def find_arbitrage_opportunities(
                         set(selection_names),
                     ):
                         continue
-                elif str(market_key).startswith(
+                elif market_type_text.startswith(
                     "totals"
                 ) and not _compatible_market_lines(
-                    market_key,
+                    market_type_text,
                     {
                         selection_names[0]: first_quote,
                         selection_names[1]: second_quote,
@@ -1243,36 +1484,30 @@ def find_arbitrage_opportunities(
             (selection_names[1], second_quote),
         ]
         odds = [float(quote["odds_decimal"]) for _, quote in selection_rows]
-        raw_stakes = [
-            total_stake * (1 / price) / implied_probability_sum
-            for price in odds
-        ]
-        stakes = _allocate_rounded_stakes(
-            odds, total_stake, rounding_step, raw_stakes
-        )
-        if stakes is None:
+        sizing = size_arbitrage_stakes(odds, total_stake, rounding_step)
+        if sizing is None:
             continue
-
-        payouts = [stake * price for stake, price in zip(stakes, odds)]
-        guaranteed_payout = min(payouts)
-        profit = round(guaranteed_payout - total_stake, 2)
-        if profit <= 0:
+        sized_total, stakes, profit, guaranteed_payout = sizing
+        if profit < config.min_arb_guaranteed_profit_dollars - 1e-9:
             continue
 
         legs = []
         for stake, (selection, quote) in zip(stakes, selection_rows):
-            odds = float(quote["odds_decimal"])
+            leg_odds = float(quote["odds_decimal"])
             legs.append(
                 {
                     "selection": selection,
                     "market": quote["market"],
                     "sportsbook": quote["sportsbook"],
-                    "odds_decimal": odds,
+                    "player_id": quote.get("player_id"),
+                    "player_name": quote.get("player_name"),
+                    "line": quote.get("point"),
+                    "odds_decimal": leg_odds,
                     "odds_american": quote.get("odds_american"),
                     "liquidity": quote.get("liquidity"),
                     "liquidity_updated_at": quote.get("liquidity_updated_at"),
                     "stake": stake,
-                    "payout": round(stake * odds, 2),
+                    "payout": round(stake * leg_odds, 2),
                 }
             )
 
@@ -1285,13 +1520,24 @@ def find_arbitrage_opportunities(
                 "event_id": event_id,
                 "market_key": market_key,
                 "period": period,
+                "is_player_prop": player_prop,
+                "player_id": first_quote.get("player_id")
+                or second_quote.get("player_id"),
+                "player_name": first_quote.get("player_name")
+                or second_quote.get("player_name"),
+                "line": first_quote.get("point")
+                if first_quote.get("point") is not None
+                else second_quote.get("point"),
                 "implied_probability_sum": implied_probability_sum,
                 "theoretical_roi_pct": (1 / implied_probability_sum - 1) * 100,
-                "theoretical_profit": total_stake
+                "theoretical_profit": sized_total
                 * (1 / implied_probability_sum - 1),
-                "theoretical_locked_payout": total_stake / implied_probability_sum,
-                "roi_pct": profit / total_stake * 100,
-                "total_stake": total_stake,
+                "theoretical_locked_payout": sized_total
+                / implied_probability_sum,
+                "roi_pct": profit / sized_total * 100,
+                "total_stake": sized_total,
+                "requested_total_stake": total_stake,
+                "min_guaranteed_profit": config.min_arb_guaranteed_profit_dollars,
                 "locked_payout": round(guaranteed_payout, 2),
                 "profit": profit,
                 "legs": legs,

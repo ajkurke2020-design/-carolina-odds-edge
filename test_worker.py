@@ -8,9 +8,13 @@ from unittest.mock import MagicMock, patch
 
 from worker import (
     ACTIVE_SPORTS,
+    DEFAULT_MAX_EV_THRESHOLD,
     DEFAULT_MIN_ARB_ROI,
+    DEFAULT_MIN_EV_THRESHOLD,
     MAX_HISTORY_AGE_SECONDS,
     MAX_SINGLE_BET,
+    _atomic_write_json,
+    apply_arbitrage_size_limits,
     build_alert_key,
     build_arbitrage_alert_key,
     check_and_welcome_new_members,
@@ -30,7 +34,9 @@ from worker import (
     send_telegram_message,
     should_alert,
     should_alert_arbitrage,
+    worker_ev_settings,
 )
+from scanner_config import CONFIG
 
 
 class WorkerTests(unittest.TestCase):
@@ -332,24 +338,24 @@ class WorkerTests(unittest.TestCase):
                     "market": "Moneyline",
                     "kickoff": future_kickoff,
                     "total_stake": 500.0,
-                    "implied_probability_sum": 0.96,
-                    "profit": 15.0,
-                    "roi_pct": 3.0,
-                    "locked_payout": 515.0,
+                    "implied_probability_sum": 0.9307,
+                    "profit": 37.2,
+                    "roi_pct": 7.44,
+                    "locked_payout": 537.2,
                     "legs": [
                         {
                             "selection": "Team A",
                             "sportsbook": "FanDuel",
-                            "odds_decimal": 2.1,
-                            "stake": 240.0,
-                            "payout": 504.0,
+                            "odds_decimal": 2.2,
+                            "stake": 244.0,
+                            "payout": 536.8,
                         },
                         {
                             "selection": "Team B",
                             "sportsbook": "DraftKings",
-                            "odds_decimal": 2.05,
-                            "stake": 260.0,
-                            "payout": 533.0,
+                            "odds_decimal": 2.1,
+                            "stake": 256.0,
+                            "payout": 537.6,
                         },
                     ],
                 },
@@ -453,6 +459,89 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(used_key, "key_2")
             self.assertEqual(mock_run_api.call_count, 2)
             self.assertEqual(len(res["quotes"]), 1)
+
+    def test_default_ev_floor_is_3_5_percent_with_no_upper_cap(self):
+        self.assertEqual(DEFAULT_MIN_EV_THRESHOLD, 3.5)
+        self.assertEqual(CONFIG.worker_min_ev_pct, 3.5)
+        self.assertIsNone(DEFAULT_MAX_EV_THRESHOLD)
+        self.assertIsNone(CONFIG.worker_max_ev_pct)
+
+    def test_worker_ev_settings_allow_uncapped_environment(self):
+        with patch.dict(
+            os.environ,
+            {"WORKER_MIN_EV_PCT": "4.25", "WORKER_MAX_EV_PCT": "none"},
+            clear=False,
+        ):
+            self.assertEqual(worker_ev_settings(), (4.25, None))
+
+    def test_telegram_ev_alert_escapes_feed_text(self):
+        opportunity = {
+            "sport": "NBA",
+            "matchup": "<b>Home</b> & Away",
+            "market": "Moneyline",
+            "selection": "Home <script>",
+            "sportsbook": "Book & Co",
+            "odds_american": 120,
+            "odds_decimal": 2.2,
+            "fair_probability": 0.5,
+            "ev_pct": 10.0,
+            "kelly_stake": 10.0,
+        }
+        message = format_telegram_alert(opportunity)
+        self.assertIn("&lt;b&gt;Home&lt;/b&gt; &amp; Away", message)
+        self.assertIn("Home &lt;script&gt;", message)
+        self.assertIn("Book &amp; Co", message)
+        self.assertNotIn("<script>", message)
+        self.assertNotIn("<b>Home</b>", message)
+
+    def test_apply_arbitrage_size_limits_enforces_the_per_leg_maximum(self):
+        # Lopsided stakes exceed the $300 per-leg rule; the helper scales the
+        # total down without applying any profit cap.
+        arb = {
+            "total_stake": 1000,
+            "legs": [
+                {
+                    "selection": "Home",
+                    "sportsbook": "DraftKings",
+                    "odds_decimal": 2.5,
+                    "stake": 625,
+                    "payout": 1562.5,
+                },
+                {
+                    "selection": "Away",
+                    "sportsbook": "FanDuel",
+                    "odds_decimal": 1.7,
+                    "stake": 375,
+                    "payout": 637.5,
+                },
+            ],
+        }
+        self.assertTrue(
+            apply_arbitrage_size_limits(
+                arb,
+                max_leg_stake=300.0,
+                rounding_step=1,
+            )
+        )
+        self.assertLess(arb["total_stake"], 1000)
+        self.assertTrue(arb["stake_reduced"])
+        self.assertGreater(arb["profit"], 0)
+        self.assertLessEqual(max(leg["stake"] for leg in arb["legs"]), 300)
+        payouts = [leg["payout"] for leg in arb["legs"]]
+        self.assertGreaterEqual(min(payouts), arb["total_stake"])
+        self.assertEqual(
+            round(min(payouts) - arb["total_stake"], 2), arb["profit"]
+        )
+
+    def test_atomic_json_write_leaves_no_temporary_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            _atomic_write_json(path, {"ok": True})
+
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(f"{path}.tmp"))
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"ok": True})
 
 
 if __name__ == "__main__":

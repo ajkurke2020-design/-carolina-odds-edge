@@ -5,4 +5,7 @@ data/
 vendor/
 .env
 .env.*
+!.env.example
 .streamlit/secrets.toml
+quota_state.json
+*.tmp

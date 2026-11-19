@@ -27,6 +27,7 @@ from scanner_logic import (
     deduplicate_alt_line_ladders,
     filter_quotes,
     find_arbitrage_opportunities,
+    is_player_prop_quote,
     scan_pinnacle_ev,
 )
 from app_auth import passphrase_matches
@@ -432,9 +433,15 @@ arb_rounding = st.sidebar.selectbox(
     index=[1, 5, 10, 25].index(CONFIG.arbitrage_rounding_step),
 )
 st.sidebar.caption(
+    f"Arbitrage cards require at least "
+    f"${CONFIG.min_arb_guaranteed_profit_dollars:,.0f} guaranteed profit at "
+    "this stake. Raise the stake if no cards appear."
+)
+st.sidebar.caption(
     f"Enabled venues: {', '.join(DEFAULT_BOOKS)}. Fair % requires a matching "
-    f"Pinnacle market. Minimum +EV: {CONFIG.min_ev_pct:.1f}%. Kelly suggestions are "
-    f"capped at {CONFIG.max_bet_pct:.0%} per bet and "
+    f"Pinnacle market. Board minimum +EV: {CONFIG.min_ev_pct:.1f}%; automated "
+    f"Telegram floor: {CONFIG.worker_min_ev_pct:.1f}% with no upper cap. Kelly "
+    f"suggestions are capped at {CONFIG.max_bet_pct:.0%} per bet and "
     f"{CONFIG.max_event_pct:.0%} per event. Line-adjusted pricing is "
     f"{'enabled' if CONFIG.enable_line_adjusted else 'disabled'}."
 )
@@ -653,6 +660,11 @@ ev_candidates = [
     for quote in ev_candidates
     if (quote["sport"], quote["event_id"]) in visible_events
 ]
+ev_candidates = [
+    quote
+    for quote in ev_candidates
+    if not is_player_prop_quote(quote)
+]
 if search_term:
     ev_candidates = [
         quote
@@ -713,6 +725,7 @@ if diagnostics:
             "below_min_liquidity": "Below minimum liquidity",
             "alt_line_duplicate": "Lower-EV alternate-line duplicate",
             "ambiguous_pinnacle_quote": "Ambiguous Pinnacle quote (conflicting prices)",
+            "player_prop_excluded": "Player prop excluded from +EV",
         }
         dropped = diagnostics["dropped"]
         st.dataframe(
@@ -887,10 +900,17 @@ with tab_arb:
     for opportunity_index, opportunity in enumerate(arbitrage_opportunities):
         with st.container(border=True):
             event_column, profit_column = st.columns([3, 1])
+            market_summary = opportunity["market"]
+            if opportunity.get("player_name"):
+                market_summary = (
+                    f"{opportunity['player_name']} · {market_summary}"
+                )
+            if opportunity.get("line") is not None:
+                market_summary += f" · {float(opportunity['line']):g}"
             event_column.markdown(
                 f"**{opportunity['matchup']}** · {opportunity['sport']} · "
                 f"{_format_kickoff_et(opportunity['kickoff'])} · "
-                f"{opportunity['period'] or 'Full market'}"
+                f"{market_summary} · {opportunity['period'] or 'Full market'}"
             )
             profit_column.metric(
                 "Projected gross profit",
@@ -905,8 +925,29 @@ with tab_arb:
             )
             legs = st.columns(len(opportunity["legs"]))
             for index, leg in enumerate(opportunity["legs"]):
+                leg_market = leg.get("market") or opportunity["market"]
+                if leg.get("player_name"):
+                    leg_title = (
+                        f"{leg['player_name']} {leg['selection']}"
+                        + (
+                            f" {float(leg['line']):g}"
+                            if leg.get("line") is not None
+                            else ""
+                        )
+                    )
+                elif opportunity.get("player_name"):
+                    leg_title = (
+                        f"{opportunity['player_name']} {leg['selection']}"
+                        + (
+                            f" {float(opportunity['line']):g}"
+                            if opportunity.get("line") is not None
+                            else ""
+                        )
+                    )
+                else:
+                    leg_title = leg["selection"]
                 legs[index].markdown(
-                    f"**{leg['selection']}**  \n{leg['market']}  \n"
+                    f"**{leg_title}**  \n{leg_market}  \n"
                     f"**{leg['sportsbook']}** · {leg['odds_decimal']:.2f} decimal "
                     f"({decimal_to_american(leg['odds_decimal']):+d} American)  \n"
                     f"Bet **${leg['stake']:,.0f}**  \n"
@@ -942,9 +983,12 @@ with tab_arb:
     if all_quotes:
         st.caption(
             "Each card tells you the stake for each outcome and the return if it wins. "
-            "Only two-outcome opportunities with opposite spread points and a different "
-            "venue on each leg are shown. The total stake is allocated using the selected "
-            f"${arb_rounding} rounding increment. Confirm both bets are accepted at the displayed odds; limits, "
+            "Pinnacle is never used as an arbitrage leg. Only two-outcome opportunities "
+            "with opposite spread points, matching player-prop lines, and a different "
+            "venue on each leg are shown. Only opportunities that still guarantee at "
+            f"least ${CONFIG.min_arb_guaranteed_profit_dollars:,.2f} profit after "
+            f"allocation are shown; stakes use the selected ${arb_rounding} rounding "
+            "increment. Confirm both bets are accepted at the displayed odds; limits, "
             "fees, price movement, insufficient quote liquidity, and differing settlement "
             "rules can remove the projected gross profit. Displayed liquidity is not used "
             "to cap stake sizes."

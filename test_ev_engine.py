@@ -113,6 +113,23 @@ class LiquidityStakeTests(unittest.TestCase):
     def test_default_minimum_liquidity_is_twenty_five_dollars(self):
         self.assertEqual(CONFIG.min_liquidity_dollars, 25.0)
 
+    def test_player_props_never_receive_a_kelly_stake(self):
+        stakes = calculate_capped_kelly_stakes(
+            [
+                opportunity(
+                    is_player_prop=True,
+                    market_key="player_points:24.5",
+                ),
+                opportunity(event_id="game-2"),
+            ],
+            bankroll=1000,
+            fraction=0.25,
+            per_bet_cap_fraction=1,
+            per_event_cap_fraction=1,
+        )
+        self.assertEqual(stakes[0], 0.0)
+        self.assertGreater(stakes[1], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

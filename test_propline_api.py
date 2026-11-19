@@ -1,5 +1,7 @@
+import os
+import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import requests
@@ -9,8 +11,11 @@ from propline_api import (
     EASTERN,
     _event_is_in_mode,
     american_to_decimal,
+    get_rotating_api_keys,
+    load_quota_state,
     parse_odds_payload,
     run_api,
+    sport_markets,
 )
 
 
@@ -592,7 +597,10 @@ class PropLineApiTests(unittest.TestCase):
         self.assertEqual(
             session.get.call_args.kwargs["params"],
             {
-                "markets": "h2h,spreads,totals",
+                "markets": (
+                    "h2h,spreads,totals,"
+                    "player_points,player_rebounds,player_assists"
+                ),
                 "bookmakers": ",".join(
                     [*APPROVED_BOOKMAKERS, "pinnacle"]
                 ),
@@ -775,6 +783,114 @@ class PropLineApiTests(unittest.TestCase):
         self.assertEqual(result["request_count"], 0)
         self.assertTrue(result["errors"])
         make_session.assert_not_called()
+
+    def test_bulk_markets_include_player_props_per_sport(self):
+        self.assertEqual(
+            sport_markets("NBA"),
+            "h2h,spreads,totals,player_points,player_rebounds,player_assists",
+        )
+        self.assertEqual(
+            sport_markets("NCAAB"),
+            "h2h,spreads,totals,player_points,player_rebounds,player_assists",
+        )
+        self.assertEqual(
+            sport_markets("NFL"),
+            "h2h,spreads,totals,player_pass_yds,player_rush_yds,"
+            "player_reception_yds",
+        )
+        self.assertEqual(
+            sport_markets("NCAAF"),
+            "h2h,spreads,totals,player_pass_yds,player_rush_yds,"
+            "player_reception_yds",
+        )
+        # Non-prop sports keep the original three markets.
+        self.assertEqual(sport_markets("MLB"), "h2h,spreads,totals")
+
+    def test_dual_keys_rotate_at_noon_utc(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PROPLINE_API_KEY_1": "key_one",
+                "PROPLINE_API_KEY_2": "key_two",
+            },
+            clear=True,
+        ):
+            morning = datetime(2026, 1, 1, 11, 59, tzinfo=timezone.utc)
+            afternoon = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+            self.assertEqual(
+                get_rotating_api_keys(morning), ["key_one", "key_two"]
+            )
+            self.assertEqual(
+                get_rotating_api_keys(afternoon), ["key_two", "key_one"]
+            )
+
+    def test_low_primary_quota_fails_over_to_secondary_key(self):
+        low_response = Mock()
+        low_response.status_code = 200
+        low_response.headers = {"X-Daily-Remaining": "5"}
+        low_response.json.return_value = []
+
+        healthy_response = Mock()
+        healthy_response.status_code = 200
+        healthy_response.headers = {"X-Daily-Remaining": "990"}
+        healthy_response.json.return_value = []
+
+        session = Mock()
+        session.get.side_effect = [low_response, healthy_response]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            quota_file = os.path.join(tmpdir, "quota_state.json")
+            with patch("propline_api.requests.Session", return_value=session):
+                result = run_api(
+                    ["NBA"],
+                    "live",
+                    api_keys=["primary_key", "secondary_key"],
+                    quota_state_file=quota_file,
+                    failover_threshold=15,
+                )
+
+            used_keys = [
+                call.kwargs["headers"]["X-API-Key"]
+                for call in session.get.call_args_list
+            ]
+            self.assertEqual(used_keys, ["primary_key", "secondary_key"])
+            self.assertTrue(result["failover_used"])
+            self.assertEqual(result["request_count"], 2)
+
+            state = load_quota_state(quota_file)
+            self.assertEqual(len(state["keys"]), 2)
+
+    def test_rate_limited_primary_fails_over_to_secondary_key(self):
+        limited_response = Mock()
+        limited_response.status_code = 429
+        limited_response.headers = {
+            "X-Daily-Remaining": "0",
+            "Retry-After": "30",
+        }
+
+        healthy_response = Mock()
+        healthy_response.status_code = 200
+        healthy_response.headers = {"X-Daily-Remaining": "995"}
+        healthy_response.json.return_value = []
+
+        session = Mock()
+        session.get.side_effect = [limited_response, healthy_response]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("propline_api.requests.Session", return_value=session):
+                result = run_api(
+                    ["NBA"],
+                    "live",
+                    api_keys=["primary_key", "secondary_key"],
+                    quota_state_file=os.path.join(tmpdir, "quota_state.json"),
+                )
+
+        self.assertTrue(result["failover_used"])
+        used_keys = [
+            call.kwargs["headers"]["X-API-Key"]
+            for call in session.get.call_args_list
+        ]
+        self.assertEqual(used_keys, ["primary_key", "secondary_key"])
 
     def test_rate_limit_is_reported_without_retrying_requests(self):
         response = Mock()

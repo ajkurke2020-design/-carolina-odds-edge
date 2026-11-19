@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Standalone background worker for automated +EV bet and Arbitrage notifications.
+Standalone local/VPS cron worker for automated +EV and Arbitrage alerts.
 
-Scans active sports via PropLine API, detects +EV opportunities against Pinnacle
-and risk-free arbitrage opportunities across approved books, caches odds data,
-tracks alert history to avoid duplicate notifications, sends alerts to Telegram,
-welcomes new members with educational onboarding guides, and supports backup API keys.
+The worker is intentionally decoupled from Git: it reads configuration from the
+environment (or a local ``.env`` file), writes JSON state atomically, records
+scans in ``data/bets.db`` through SQLite transactions, and exits after one
+scan-and-alert cycle so a cron entry can run it on a schedule.
+
+Player props are arbitrage-only. They are never evaluated for +EV, alerted as
++EV, or logged as Pinnacle +EV/CLV snapshots.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -27,12 +31,30 @@ from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPSConnectionPool
 from urllib3.util import connection as urllib3_connection
 
-from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
-from propline_api import SPORT_CONFIG, run_api
-from scanner_config import CONFIG
-from scanner_logic import _allocate_rounded_stakes, find_arbitrage_opportunities, scan_pinnacle_ev
+# A local .env file keeps the VPS cron install self-contained. Environment
+# variables always win because python-dotenv does not override existing values.
+try:  # pragma: no cover - exercised implicitly when python-dotenv is installed
+    from dotenv import load_dotenv
 
-# Active sports to scan (MLB commented out for the offseason)
+    load_dotenv()
+except ImportError:  # pragma: no cover
+    pass
+
+from ev_engine import calculate_capped_kelly_stakes, decimal_to_american
+from propline_api import (
+    record_quota,
+    run_api,
+    select_api_keys,
+)
+from scanner_config import CONFIG
+from scanner_logic import (
+    find_arbitrage_opportunities,
+    is_player_prop_quote,
+    scan_pinnacle_ev,
+    size_arbitrage_stakes,
+)
+
+# Active sports to scan (MLB is omitted during the offseason).
 ACTIVE_SPORTS = [
     "Tennis",
     "NCAAB",
@@ -45,18 +67,52 @@ ACTIVE_SPORTS = [
 
 ALERT_HISTORY_FILE = "alert_history.json"
 CACHED_ODDS_FILE = "cached_odds.json"
-DEFAULT_MIN_EV_THRESHOLD = 3.0
+DEFAULT_MIN_EV_THRESHOLD = CONFIG.worker_min_ev_pct  # 3.5% automated floor
+DEFAULT_MAX_EV_THRESHOLD = CONFIG.worker_max_ev_pct  # None: no upper cap
 DEFAULT_MIN_EV_INCREASE_FOR_RE_ALERT = 1.5
 DEFAULT_MIN_ROI_INCREASE_FOR_ARB = 0.5
 MAX_HISTORY_AGE_SECONDS = 48 * 3600  # 48 hours
 
-# Risk and Bankroll Limits: Never suggest a single bet over $300
+# Risk and Bankroll Limits: Never suggest a single bet over $300.
 MAX_SINGLE_BET = 300.0
 DEFAULT_MIN_ARB_ROI = 1.0  # 1.0% minimum ROI for Arbitrage alerts
 ARBITRAGE_TARGET_TOTAL_STAKE = 500.0  # Base stake scaled so no single leg exceeds $300
 
 
-# --- IPv4 Adapter for Telegram API (prevents IPv6 connection resets on Windows/ISPs) ---
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _env_optional_float(name: str, default: float | None) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if raw.casefold() in {"none", "off", "disabled", "uncapped"}:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
+def worker_ev_settings() -> tuple[float, float | None]:
+    """Read the automated +EV floor/cap from the environment."""
+    min_ev = _env_float("WORKER_MIN_EV_PCT", CONFIG.worker_min_ev_pct)
+    max_ev = _env_optional_float("WORKER_MAX_EV_PCT", CONFIG.worker_max_ev_pct)
+    if max_ev is not None and max_ev < min_ev:
+        max_ev = None
+    return min_ev, max_ev
+
+
+# --- IPv4 Adapter for Telegram API (prevents IPv6 connection resets) ---
 class _IPv4HTTPSConnection(HTTPSConnection):
     def _new_conn(self) -> socket.socket:
         address = socket.getaddrinfo(
@@ -87,54 +143,115 @@ def _new_telegram_session() -> requests.Session:
     return session
 
 
-def get_api_keys() -> list[str]:
-    """Retrieve ordered list of PropLine API keys (primary + backup) from environment variables."""
+# ---------------------------------------------------------------------------
+# Atomic state files
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Write ``path`` atomically through a sibling ``.tmp`` file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    last_error: OSError | None = None
+    for attempt in range(5):
+        try:
+            os.replace(temporary_path, path)
+            return
+        except PermissionError as error:  # Windows can briefly lock the file.
+            last_error = error
+            time.sleep(0.05 * (attempt + 1))
+    if os.path.exists(temporary_path):
+        os.remove(temporary_path)
+    if last_error is not None:
+        raise last_error
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    _atomic_write_text(path, json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Environment credentials
+# ---------------------------------------------------------------------------
+
+
+def get_api_keys(now: datetime | None = None) -> list[str]:
+    """Return ordered PropLine keys (UTC half-day primary first, then backups)."""
     keys: list[str] = []
 
-    # Comma-separated list if provided
+    def add(key: str) -> None:
+        key = key.strip()
+        if key and key not in keys:
+            keys.append(key)
+
+    # Honor the persisted quota state so a key that is already below the
+    # failover threshold does not become the primary for this scan.
+    for key in select_api_keys(
+        now, os.getenv("QUOTA_STATE_FILE", CONFIG.quota_state_file)
+    ):
+        add(key)
+
     for key_var in ("PROPLINE_API_KEYS", "PROP_LINE_API_KEYS"):
         val = os.getenv(key_var, "").strip()
         if val:
             for part in val.split(","):
-                k = part.strip()
-                if k and k not in keys:
-                    keys.append(k)
+                add(part)
 
-    # Primary key names
     for key_var in ("PROPLINE_API_KEY", "PROP_LINE_API_KEY", "API_KEY"):
-        val = os.getenv(key_var, "").strip()
-        if val and val not in keys:
-            keys.append(val)
+        add(os.getenv(key_var, ""))
 
-    # Backup key names
     for key_var in (
         "PROPLINE_API_KEY_BACKUP",
         "PROP_LINE_API_KEY_BACKUP",
         "PROPLINE_BACKUP_KEY",
         "API_KEY_BACKUP",
     ):
-        val = os.getenv(key_var, "").strip()
-        if val and val not in keys:
-            keys.append(val)
+        add(os.getenv(key_var, ""))
 
     return keys
 
 
-def get_api_key() -> str:
-    """Retrieve first available PropLine API key."""
-    keys = get_api_keys()
+def get_api_key(now: datetime | None = None) -> str:
+    keys = get_api_keys(now)
     return keys[0] if keys else ""
 
 
 def get_telegram_credentials() -> tuple[str, str]:
-    """Retrieve Telegram bot token and chat ID from environment variables."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     return bot_token, chat_id
 
 
+def get_discord_webhook() -> str:
+    return os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+
+def _quota_state_path() -> str:
+    return os.getenv("QUOTA_STATE_FILE", CONFIG.quota_state_file)
+
+
+def _get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _get_float_env(name: str, default: float) -> float:
+    return _env_float(name, default)
+
+
+# ---------------------------------------------------------------------------
+# Scheduling helpers
+# ---------------------------------------------------------------------------
+
+
 def is_game_started(commence_time_str: str | None, now_utc: datetime) -> bool:
-    """Check if the event's commence time is at or before the current UTC time."""
     if not commence_time_str or not isinstance(commence_time_str, str):
         return False
     try:
@@ -146,11 +263,56 @@ def is_game_started(commence_time_str: str | None, now_utc: datetime) -> bool:
         return False
 
 
+def select_scan_sports(
+    configured: list[str] | None = None,
+    cached: dict[str, Any] | None = None,
+) -> list[str]:
+    """
+    Drop explicitly configured off-season sports and any sport whose latest
+    cached scan saw zero events. This avoids spending one credit on empty
+    slates while keeping sports that have never been scanned.
+    """
+    configured = configured or ACTIVE_SPORTS
+    offseason_raw = os.getenv("WORKER_OFFSEASON_SPORTS", "")
+    offseason = {
+        item.strip().casefold()
+        for item in offseason_raw.split(",")
+        if item.strip()
+    }
+    candidates = [
+        sport for sport in configured if sport.casefold() not in offseason
+    ]
+    if not cached:
+        return candidates
+
+    cached_sports = {
+        str(sport) for sport in cached.get("sports", []) if sport
+    }
+    quote_counts: dict[str, int] = {}
+    for quote in cached.get("quotes", []):
+        sport = str(quote.get("sport") or "")
+        if sport:
+            quote_counts[sport] = quote_counts.get(sport, 0) + 1
+
+    selected: list[str] = []
+    for sport in candidates:
+        if sport in cached_sports and quote_counts.get(sport, 0) == 0:
+            print(
+                f"Skipping {sport}: the latest cached scan found no upcoming "
+                "or live events (off-season or empty slate)."
+            )
+            continue
+        selected.append(sport)
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Alert keys & deduplication
+# ---------------------------------------------------------------------------
+
+
 def build_alert_key(opp: dict[str, Any]) -> str:
-    """
-    Generate unique tracking key for a +EV opportunity:
-    {game_id}_{market}_{selection}_{line}_{sportsbook}
-    """
+    """{game_id}_{market}_{selection}_{line}_{sportsbook}"""
     game_id = str(opp.get("event_id") or opp.get("game_id") or "")
     market = str(opp.get("market") or opp.get("market_key") or "")
     selection = str(opp.get("selection") or "")
@@ -161,28 +323,32 @@ def build_alert_key(opp: dict[str, Any]) -> str:
 
 
 def build_arbitrage_alert_key(arb: dict[str, Any]) -> str:
-    """
-    Generate unique tracking key for an arbitrage opportunity:
-    arb_{game_id}_{market}_{sorted_legs}
-    """
+    """arb_{game_id}_{market}[_{player}][_{line}]_{sorted_legs}"""
     game_id = str(arb.get("event_id") or "")
     market = str(arb.get("market") or arb.get("market_key") or "")
+    parts = ["arb", game_id, market]
+    player = str(arb.get("player_id") or arb.get("player_name") or "")
+    if player:
+        parts.append(player)
+    line = arb.get("line")
+    if line is not None:
+        parts.append(str(line))
     legs_repr = "-".join(
         sorted(
             f"{leg.get('selection')}_{leg.get('sportsbook')}"
             for leg in arb.get("legs", [])
         )
     )
-    return f"arb_{game_id}_{market}_{legs_repr}"
+    parts.append(legs_repr)
+    return "_".join(parts)
 
 
 def load_alert_history(path: str = ALERT_HISTORY_FILE) -> dict[str, dict[str, Any]]:
-    """Load alert history dictionary from disk."""
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
             return data if isinstance(data, dict) else {}
     except Exception as error:
         print(f"Warning: Could not read {path}: {error}. Starting with empty history.")
@@ -192,10 +358,8 @@ def load_alert_history(path: str = ALERT_HISTORY_FILE) -> dict[str, dict[str, An
 def save_alert_history(
     history: dict[str, dict[str, Any]], path: str = ALERT_HISTORY_FILE
 ) -> None:
-    """Persist alert history dictionary to disk."""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        _atomic_write_json(path, history)
     except Exception as error:
         print(f"Error: Failed to save {path}: {error}", file=sys.stderr)
 
@@ -205,7 +369,6 @@ def clean_expired_history(
     now_ts: float,
     max_age_seconds: float = MAX_HISTORY_AGE_SECONDS,
 ) -> dict[str, dict[str, Any]]:
-    """Remove alert history entries older than 48 hours."""
     cleaned = {}
     for key, entry in history.items():
         if not isinstance(entry, dict):
@@ -222,10 +385,6 @@ def should_alert(
     history: dict[str, dict[str, Any]],
     min_increase: float = DEFAULT_MIN_EV_INCREASE_FOR_RE_ALERT,
 ) -> bool:
-    """
-    Determine whether to send a +EV alert:
-    True if the key is new, OR if EV% on that exact same line increased by >= +1.5%.
-    """
     if key not in history:
         return True
     prev_entry = history[key]
@@ -239,10 +398,6 @@ def should_alert_arbitrage(
     history: dict[str, dict[str, Any]],
     min_increase: float = DEFAULT_MIN_ROI_INCREASE_FOR_ARB,
 ) -> bool:
-    """
-    Determine whether to send an Arbitrage alert:
-    True if the key is new, OR if ROI% on that opportunity increased by >= +0.5%.
-    """
     if key not in history:
         return True
     prev_entry = history[key]
@@ -250,15 +405,17 @@ def should_alert_arbitrage(
     return (current_roi - prev_roi) >= min_increase
 
 
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+
 def format_kelly_units(
     stake: float, bankroll: float = CONFIG.bankroll, max_single_bet: float = MAX_SINGLE_BET
 ) -> str:
     """
-    Format recommended Kelly stake into standard sports betting units in 0.25u increments
-    (e.g., 0.25u, 0.5u, 0.75u, 1u, 1.25u, 1.5u, 1.75u, 2u).
-    Capped at max_single_bet ($300).
-    1 unit is defined as 1% of the bankroll ($10 for default $1,000 bankroll).
-    Rounds to the nearest 0.25 unit.
+    Format a Kelly stake in 0.25u increments (1u = 1% of bankroll), capped at
+    ``max_single_bet``.
     """
     effective_stake = min(stake, max_single_bet)
     unit_size = bankroll * 0.01
@@ -273,19 +430,49 @@ def format_kelly_units(
     return f"{rounded:g}u"
 
 
+def _format_american(odds_american: Any, odds_decimal: Any) -> str:
+    if odds_american is not None:
+        try:
+            odds_str = f"{int(odds_american):+d}"
+        except (ValueError, TypeError):
+            odds_str = str(odds_american)
+    elif odds_decimal is not None:
+        try:
+            odds_str = f"{decimal_to_american(float(odds_decimal)):+d}"
+        except Exception:
+            odds_str = "N/A"
+    else:
+        odds_str = "N/A"
+    if odds_decimal is not None:
+        try:
+            odds_str += f" ({float(odds_decimal):.2f})"
+        except (ValueError, TypeError):
+            pass
+    return odds_str
+
+
+def _format_point(value: Any, signed: bool = False) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{number:+g}" if signed else f"{number:g}"
+
+
+def _escaped(value: Any) -> str:
+    """Escape user/feed text for Telegram HTML parse mode."""
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
 def format_telegram_alert(opp: dict[str, Any]) -> str:
-    """
-    Format +EV opportunity cleanly with HTML showing:
-    Sport, Matchup, Bet/Line, Odds, Sportsbook, Fair Odds, EV%, and Recommended Kelly Units.
-    Omits raw dollar amounts for stakes; displays unit size with clear explanation.
-    """
-    sport = html.escape(str(opp.get("sport") or "Unknown"))
-    matchup = html.escape(str(opp.get("matchup") or "Unknown Matchup"))
-    selection = html.escape(str(opp.get("selection") or ""))
+    """Format a +EV opportunity for Telegram HTML."""
+    sport = _escaped(opp.get("sport") or "Unknown")
+    matchup = _escaped(opp.get("matchup") or "Unknown Matchup")
+    selection = _escaped(opp.get("selection") or "")
     market_raw = str(opp.get("market") or opp.get("market_key") or "")
     line = opp.get("line") if opp.get("line") is not None else opp.get("point")
+    player_name = str(opp.get("player_name") or "").strip()
 
-    # Format market label cleanly (e.g. Spread, Total, Team Total, Moneyline)
     if "team" in market_raw.lower():
         market_label = f"{opp.get('team', '')} Team Total".strip()
     elif "spread" in market_raw.lower():
@@ -297,43 +484,23 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
     else:
         market_label = market_raw
 
-    # Format Bet / Line cleanly
+    market_label = _escaped(market_label)
     if line is not None:
-        try:
-            line_num = float(line)
-            line_str = f"{line_num:+g}" if "spread" in market_raw.lower() else f"{line_num:g}"
-        except (ValueError, TypeError):
-            line_str = str(line)
-        bet_line = f"{selection} {line_str} ({market_label})"
+        line_text = _format_point(line, signed="spread" in market_raw.lower())
+        player_prefix = f"{_escaped(player_name)} " if player_name else ""
+        bet_line = f"{player_prefix}{selection} {line_text} ({market_label})"
     else:
-        bet_line = f"{selection} ({market_label})" if market_label else selection
+        player_prefix = f"{_escaped(player_name)} " if player_name else ""
+        bet_line = (
+            f"{player_prefix}{selection} ({market_label})"
+            if market_label
+            else f"{player_prefix}{selection}"
+        )
 
-    # Odds
-    odds_am = opp.get("odds_american")
-    odds_dec = opp.get("odds_decimal")
-    if odds_am is not None:
-        try:
-            am_int = int(odds_am)
-            odds_str = f"{am_int:+d}"
-        except (ValueError, TypeError):
-            odds_str = str(odds_am)
-    elif odds_dec is not None:
-        try:
-            odds_str = f"{decimal_to_american(float(odds_dec)):+d}"
-        except Exception:
-            odds_str = "N/A"
-    else:
-        odds_str = "N/A"
+    odds_str = _format_american(opp.get("odds_american"), opp.get("odds_decimal"))
+    sportsbook = _escaped(opp.get("sportsbook") or "Unknown")
 
-    if odds_dec is not None:
-        try:
-            odds_str += f" ({float(odds_dec):.2f})"
-        except (ValueError, TypeError):
-            pass
-
-    sportsbook = html.escape(str(opp.get("sportsbook") or "Unknown"))
-
-    # Fair odds
+    fair_str = "N/A"
     fair_prob = opp.get("fair_probability")
     if fair_prob is not None:
         try:
@@ -342,24 +509,26 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
                 fair_dec = 1.0 / fp
                 fair_am = decimal_to_american(fair_dec)
                 fair_str = f"{fair_am:+d} ({fair_dec:.2f}) [Fair Prob: {fp * 100:.1f}%]"
-            else:
-                fair_str = "N/A"
         except Exception:
-            fair_str = "N/A"
-    else:
-        fair_str = "N/A"
+            pass
 
     ev_pct = float(opp.get("ev_pct", 0.0))
-
-    # Recommended Kelly Stake capped at $300 (with automatic fallback calculation)
     raw_stake = opp.get("kelly_stake")
     if raw_stake is None and opp.get("fair_probability") and opp.get("odds_decimal"):
         try:
             from ev_engine import calculate_kelly
-            quote_frac = opp.get("kelly_fraction", CONFIG.kelly_fraction)
-            net_dec = float(opp.get("odds_decimal_net", opp["odds_decimal"]))
-            k_val = calculate_kelly(CONFIG.bankroll, float(opp["fair_probability"]), net_dec, quote_frac)
-            raw_stake = min(float(k_val), CONFIG.bankroll * CONFIG.max_bet_pct)
+
+            quote_fraction = opp.get("kelly_fraction", CONFIG.kelly_fraction)
+            net_decimal = float(opp.get("odds_decimal_net", opp["odds_decimal"]))
+            kelly_value = calculate_kelly(
+                CONFIG.bankroll,
+                float(opp["fair_probability"]),
+                net_decimal,
+                quote_fraction,
+            )
+            raw_stake = min(
+                float(kelly_value), CONFIG.bankroll * CONFIG.max_bet_pct
+            )
         except Exception:
             raw_stake = 0.0
 
@@ -377,59 +546,66 @@ def format_telegram_alert(opp: dict[str, Any]) -> str:
         f"🏆 <b>Sport:</b> {sport}\n"
         f"⚔️ <b>Matchup:</b> {matchup}\n"
         f"🎯 <b>Bet / Line:</b> {bet_line}\n"
-        f"💰 <b>Odds:</b> {odds_str}\n"
+        f"💰 <b>Odds:</b> {_escaped(odds_str)}\n"
         f"🏢 <b>Sportsbook:</b> {sportsbook}\n"
-        f"⚖️ <b>Fair Odds:</b> {fair_str}\n"
+        f"⚖️ <b>Fair Odds:</b> {_escaped(fair_str)}\n"
         f"📈 <b>EV%:</b> +{ev_pct:.2f}%\n"
         f"💵 <b>Recommended Stake:</b> {stake_text}"
     )
 
 
+def _arb_leg_display(leg: dict[str, Any], arb: dict[str, Any]) -> str:
+    selection = _escaped(leg.get("selection") or "")
+    player_name = str(
+        leg.get("player_name") or arb.get("player_name") or ""
+    ).strip()
+    line = leg.get("line") if leg.get("line") is not None else arb.get("line")
+    if player_name:
+        line_text = f" {_format_point(line)}" if line is not None else ""
+        return f"{_escaped(player_name)} {selection}{line_text}"
+    if line is not None:
+        market_text = str(arb.get("market") or "").casefold()
+        signed = "spread" in market_text
+        return f"{selection} {_format_point(line, signed=signed)}"
+    return selection
+
+
 def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
-    """
-    Format Arbitrage opportunity cleanly with HTML showing:
-    Sport, Matchup, Market, Total Stake (scaled with no bet > $300), Guaranteed Profit, ROI%, and Leg Stakes.
-    """
-    sport = html.escape(str(arb.get("sport") or "Unknown"))
-    matchup = html.escape(str(arb.get("matchup") or "Unknown Matchup"))
-    market = html.escape(str(arb.get("market") or ""))
+    """Format an arbitrage opportunity for Telegram HTML."""
+    sport = _escaped(arb.get("sport") or "Unknown")
+    matchup = _escaped(arb.get("matchup") or "Unknown Matchup")
+    market = _escaped(arb.get("market") or "")
+    player_name = str(arb.get("player_name") or "").strip()
+    if player_name and market:
+        market = f"{_escaped(player_name)} · {market}"
     total_stake = float(arb.get("total_stake", 0.0))
     profit = float(arb.get("profit", 0.0))
     roi_pct = float(arb.get("roi_pct", 0.0))
     locked_payout = float(arb.get("locked_payout", total_stake + profit))
+    minimum_profit = arb.get("min_guaranteed_profit")
+    if minimum_profit is None:
+        minimum_profit = CONFIG.min_arb_guaranteed_profit_dollars
 
     legs_html = []
-    for i, leg in enumerate(arb.get("legs", []), start=1):
-        sel = html.escape(str(leg.get("selection") or ""))
-        book = html.escape(str(leg.get("sportsbook") or ""))
-        market_leg = str(leg.get("market") or "")
-        if market_leg and sel.lower() not in market_leg.lower():
-            bet_display = f"{sel} ({html.escape(market_leg)})"
-        else:
-            bet_display = sel
-
+    for index, leg in enumerate(arb.get("legs", []), start=1):
+        book = _escaped(leg.get("sportsbook") or "")
+        bet_display = _arb_leg_display(leg, arb)
         stake = float(leg.get("stake", 0.0))
         payout = float(leg.get("payout", 0.0))
-        odds_am = leg.get("odds_american")
-        odds_dec = leg.get("odds_decimal")
-        if odds_am is not None:
-            try:
-                am_int = int(odds_am)
-                odds_str = f"{am_int:+d}"
-            except (ValueError, TypeError):
-                odds_str = str(odds_am)
-        elif odds_dec is not None:
-            odds_str = f"{decimal_to_american(float(odds_dec)):+d}"
-        else:
-            odds_str = "N/A"
-        if odds_dec is not None:
-            odds_str += f" ({float(odds_dec):.2f})"
+        odds_str = _format_american(
+            leg.get("odds_american"), leg.get("odds_decimal")
+        )
+        liquidity = leg.get("liquidity")
+        liquidity_text = ""
+        if isinstance(liquidity, (int, float)) and not isinstance(liquidity, bool):
+            liquidity_text = f"\n• Liquidity: ${float(liquidity):,.2f}"
 
         legs_html.append(
-            f"<b>Leg {i}:</b>\n"
+            f"<b>Leg {index}:</b>\n"
             f"• Bet: <b>{bet_display}</b> at <b>{book}</b>\n"
-            f"• Odds: {odds_str}\n"
+            f"• Odds: {_escaped(odds_str)}\n"
             f"• Stake: <b>${stake:,.0f}</b> (Payout: ${payout:,.2f})"
+            f"{liquidity_text}"
         )
 
     legs_text = "\n\n".join(legs_html)
@@ -441,18 +617,15 @@ def format_telegram_arbitrage_alert(arb: dict[str, Any]) -> str:
         f"🎯 <b>Market:</b> {market}\n"
         f"💰 <b>Total Stake:</b> ${total_stake:,.0f} (max $300 per bet)\n"
         f"💵 <b>Guaranteed Profit:</b> +${profit:.2f} (ROI: +{roi_pct:.2f}%)\n"
-        f"🔒 <b>Locked Payout:</b> ${locked_payout:,.2f}\n\n"
+        f"🔒 <b>Locked Payout:</b> ${locked_payout:,.2f}\n"
+        f"✅ <b>Meets minimum:</b> ${float(minimum_profit):,.2f}\n\n"
         f"{legs_text}"
     )
 
 
 def format_welcome_guide(greeting_name: str | None = None) -> str:
-    """
-    Comprehensive educational guide for onboarding new Telegram group members,
-    explaining +EV, unit sizing, how to read alerts, and what to expect.
-    """
     greeting = (
-        f"👋 <b>Welcome to Not Your Bookie Edge, {greeting_name}!</b> 🎯"
+        f"👋 <b>Welcome to Not Your Bookie Edge, {_escaped(greeting_name)}!</b> 🎯"
         if greeting_name
         else "👋 <b>Welcome to Not Your Bookie Edge!</b> 🎯"
     )
@@ -471,7 +644,7 @@ def format_welcome_guide(greeting_name: str | None = None) -> str:
         f"• $5,000 bankroll ➔ 1u = $50 (0.5u = $25.00, 1.5u = $75.00)\n"
         f"Never risk more than the recommended unit size to protect against normal variance.\n\n"
         f"• <b>What is an Arbitrage Alert (⚡)?</b>\n"
-        f"A 100% risk-free trade where two sportsbooks disagree on odds. You bet both sides and lock in a guaranteed profit before the game even starts.\n\n"
+        f"A 100% risk-free trade where two sportsbooks disagree on odds. You bet both sides and lock in a guaranteed profit before the game even starts. Alerts require at least ${CONFIG.min_arb_guaranteed_profit_dollars:,.2f} in guaranteed profit.\n\n"
         f"• <b>Fair Odds:</b>\n"
         f"The true 'no-vig' probability. As long as your book offers odds equal to or better than Fair Odds, the bet has positive value.\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -484,10 +657,15 @@ def format_welcome_guide(greeting_name: str | None = None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+
 def send_telegram_message(
     bot_token: str, chat_id: str, message: str, timeout: int = 15
 ) -> bool:
-    """Send message via Telegram Bot API sendMessage using IPv4 session."""
+    """Send a message via Telegram Bot API sendMessage using an IPv4 session."""
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -514,10 +692,48 @@ def send_telegram_message(
         session.close()
 
 
+def _plain_text(message: str) -> str:
+    import re
+
+    text = re.sub(r"<[^>]+>", "", message)
+    return html.unescape(text)
+
+
+def send_discord_message(
+    webhook_url: str, message: str, timeout: int = 15
+) -> bool:
+    """Optional Discord fallback for installs that still configure a webhook."""
+    if not webhook_url:
+        return False
+    try:
+        response = requests.post(
+            webhook_url,
+            json={"content": _plain_text(message)[:1900]},
+            timeout=timeout,
+        )
+        if response.status_code in {200, 204}:
+            return True
+        print(
+            f"Discord webhook error (HTTP {response.status_code}): {response.text}",
+            file=sys.stderr,
+        )
+    except requests.RequestException as error:
+        print(f"Discord request failed: {error}", file=sys.stderr)
+    return False
+
+
+def dispatch_alert(message: str) -> bool:
+    """Send Telegram first, then fall back to Discord if configured."""
+    bot_token, chat_id = get_telegram_credentials()
+    if bot_token and chat_id and send_telegram_message(bot_token, chat_id, message):
+        return True
+    webhook = get_discord_webhook()
+    if webhook and send_discord_message(webhook, message):
+        return True
+    return False
+
+
 def check_and_welcome_new_members(bot_token: str, chat_id: str) -> int:
-    """
-    Check for new members who joined the Telegram group and send an onboarding guide.
-    """
     if not bot_token or not chat_id:
         return 0
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
@@ -548,7 +764,6 @@ def check_and_welcome_new_members(bot_token: str, chat_id: str) -> int:
                 name = user.get("first_name") or user.get("username") or "there"
                 new_member_names.append(html.escape(name))
 
-        # Acknowledge updates by incrementing offset
         if latest_update_id is not None:
             session.get(url, params={"offset": latest_update_id + 1, "timeout": 0}, timeout=5)
 
@@ -568,6 +783,11 @@ def check_and_welcome_new_members(bot_token: str, chat_id: str) -> int:
     return welcomed
 
 
+# ---------------------------------------------------------------------------
+# Cache & scan persistence
+# ---------------------------------------------------------------------------
+
+
 def save_cached_odds(
     quotes: list[dict[str, Any]],
     opportunities: list[dict[str, Any]],
@@ -576,7 +796,6 @@ def save_cached_odds(
     now_utc: datetime,
     path: str = CACHED_ODDS_FILE,
 ) -> None:
-    """Cache fetched odds data, +EV opportunities, and Arbitrage to JSON."""
     data = {
         "cached_at": now_utc.isoformat(),
         "sports": sports,
@@ -588,33 +807,85 @@ def save_cached_odds(
         "arbitrage": arbitrage,
     }
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(path, data)
     except Exception as error:
         print(f"Error: Failed to save cached odds to {path}: {error}", file=sys.stderr)
 
 
 def load_cached_odds(path: str = CACHED_ODDS_FILE) -> dict[str, Any] | None:
-    """Read cached odds data from JSON if available."""
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
             return data if isinstance(data, dict) else None
     except Exception as error:
         print(f"Warning: Failed to load {path}: {error}")
         return None
 
 
+def _database_path() -> str:
+    return os.getenv("BETS_DB_PATH", os.path.join("data", "bets.db"))
+
+
+def persist_scan_to_database(
+    observed_at: datetime,
+    opportunities: list[dict[str, Any]],
+    pinnacle_snapshots: list[dict[str, Any]],
+) -> None:
+    """
+    Log non-player-prop +EV rows and Pinnacle snapshots to ``data/bets.db``.
+
+    SQLite's transaction commit is atomic; ``database.log_scan`` wraps all
+    inserts for the scan in one transaction. Player props are filtered here as
+    a second line of defense.
+    """
+    eligible = [
+        row for row in opportunities if not is_player_prop_quote(row)
+    ]
+    snapshots = [
+        snapshot
+        for snapshot in pinnacle_snapshots
+        if not str(snapshot.get("market_key") or "")
+        .split(":", 1)[0]
+        .casefold()
+        .startswith("player_")
+    ]
+    if not eligible and not snapshots:
+        return
+    try:
+        import database
+
+        database.DB_PATH = _database_path()
+        database.log_scan(
+            str(uuid4()),
+            observed_at.isoformat(),
+            eligible,
+            snapshots,
+        )
+    except Exception as error:
+        print(
+            f"Warning: Could not log scan to {_database_path()}: {error}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Prompt/fetch helpers
+# ---------------------------------------------------------------------------
+
+
 def fetch_odds_with_fallback(
     sports: list[str],
     keys: list[str],
     mode: str = "upcoming",
+    now: datetime | None = None,
+    quota_state_file: str | None = None,
+    failover_threshold: int = CONFIG.quota_failover_threshold,
 ) -> tuple[dict[str, Any], str]:
     """
-    Fetch odds using PropLine run_api, automatically rolling over to backup keys
-    if the current key hits rate limit (429), quota exhaustion, or authentication error (401).
+    Fetch odds with automatic failover when the active key is low, rate limited,
+    or rejected. One request is made per sport per key (no per-event polling).
     """
     if not keys:
         return {
@@ -628,11 +899,18 @@ def fetch_odds_with_fallback(
     last_result: dict[str, Any] = {"quotes": [], "errors": [], "warnings": [], "quota": {}}
     used_key = keys[0]
 
-    for idx, key in enumerate(keys):
+    for index, key in enumerate(keys):
         used_key = key
-        key_label = f"Key #{idx + 1}"
+        key_label = f"Key #{index + 1}"
         print(f"Fetching odds using PropLine {key_label}...")
-        result = run_api(sports, mode=mode, api_key=key)
+        result = run_api(
+            sports,
+            mode=mode,
+            api_key=key,
+            now=now,
+            quota_state_file=quota_state_file,
+            failover_threshold=failover_threshold,
+        )
         last_result = result
 
         errors = result.get("errors", [])
@@ -643,15 +921,18 @@ def fetch_odds_with_fallback(
 
         remaining = result.get("quota", {}).get("X-Daily-Remaining")
         try:
-            is_exhausted = remaining is not None and int(remaining) <= 0
-        except ValueError:
-            is_exhausted = False
+            is_low = remaining is not None and int(remaining) < failover_threshold
+        except (TypeError, ValueError):
+            is_low = False
 
-        if (has_quota_or_auth_error or is_exhausted) and (idx + 1 < len(keys)):
-            next_label = f"Key #{idx + 2}"
+        if quota_state_file:
+            record_quota(key, result.get("quota", {}), quota_state_file, now)
+
+        if (has_quota_or_auth_error or is_low) and (index + 1 < len(keys)):
+            next_label = f"Key #{index + 2}"
             print(
-                f"Warning: PropLine {key_label} hit quota or rate limit. "
-                f"Rolling over to backup {next_label}...",
+                f"Warning: PropLine {key_label} is low or rate-limited "
+                f"({remaining} remaining). Rolling over to {next_label}...",
                 file=sys.stderr,
             )
             continue
@@ -661,50 +942,114 @@ def fetch_odds_with_fallback(
     return last_result, used_key
 
 
+def apply_arbitrage_size_limits(
+    arb: dict[str, Any],
+    max_leg_stake: float | None = None,
+    rounding_step: int = 1,
+) -> bool:
+    """Apply the per-leg stake limit to an arbitrage card in place."""
+    legs = arb.get("legs") or []
+    if len(legs) != 2:
+        return False
+    odds = [float(leg.get("odds_decimal", 0.0)) for leg in legs]
+    if any(price <= 1 for price in odds):
+        return False
+    requested_total = int(float(arb.get("total_stake", 0)))
+    sizing = size_arbitrage_stakes(
+        odds,
+        requested_total,
+        rounding_step,
+        max_leg_stake=max_leg_stake,
+    )
+    if sizing is None:
+        return False
+    total, stakes, profit, guaranteed_payout = sizing
+    arb["total_stake"] = total
+    arb["profit"] = profit
+    arb["roi_pct"] = round(profit / total * 100, 2) if total else 0.0
+    arb["locked_payout"] = round(guaranteed_payout, 2)
+    arb["stake_reduced"] = total < requested_total
+    for leg, stake in zip(legs, stakes):
+        leg["stake"] = stake
+        leg["payout"] = round(stake * float(leg["odds_decimal"]), 2)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main cycle
+# ---------------------------------------------------------------------------
+
+
 def run_worker(
     sports: list[str] | None = None,
-    min_ev: float = DEFAULT_MIN_EV_THRESHOLD,
+    min_ev: float | None = None,
     min_arb_roi: float = DEFAULT_MIN_ARB_ROI,
-    max_bet_cap: float = MAX_SINGLE_BET,
+    max_bet_cap: float | None = None,
     api_key: str | None = None,
     api_keys: list[str] | None = None,
-    history_file: str = ALERT_HISTORY_FILE,
-    cache_file: str = CACHED_ODDS_FILE,
+    history_file: str | None = None,
+    cache_file: str | None = None,
     dry_run: bool = False,
+    max_ev: float | None | object = ...,
+    quota_state_file: str | None = None,
 ) -> dict[str, Any]:
-    """Execute one scan-and-alert cycle for +EV and Arbitrage with backup key and member onboarding support."""
+    """Run one scan-and-alert cycle for +EV and arbitrage."""
     now_utc = datetime.now(timezone.utc)
     now_ts = time.time()
-    scan_sports = sports or ACTIVE_SPORTS
+    history_file = history_file or os.getenv(
+        "ALERT_HISTORY_FILE", ALERT_HISTORY_FILE
+    )
+    cache_file = cache_file or os.getenv("CACHED_ODDS_FILE", CACHED_ODDS_FILE)
+    quota_state_file = quota_state_file or _quota_state_path()
+    max_bet_cap = (
+        _get_float_env("MAX_SINGLE_BET", MAX_SINGLE_BET)
+        if max_bet_cap is None
+        else max_bet_cap
+    )
+    configured_min, configured_max = worker_ev_settings()
+    if min_ev is None:
+        min_ev = configured_min
+    if max_ev is ...:
+        max_ev = configured_max
+    if max_ev is not None and max_ev < min_ev:
+        max_ev = None
 
-    # Configure API keys (supporting primary + backup rotation)
+    cached_payload = load_cached_odds(cache_file)
+    scan_sports = sports or select_scan_sports(ACTIVE_SPORTS, cached_payload)
+
     if api_keys:
-        keys_to_use = api_keys
+        keys_to_use = [key for key in api_keys if key and key.strip()]
     elif api_key:
         keys_to_use = [api_key]
     else:
-        keys_to_use = get_api_keys()
+        keys_to_use = get_api_keys(now_utc)
 
-    print(f"[{now_utc.isoformat()}] Starting EV & Arbitrage alert worker...")
-    print(f"Active sports: {', '.join(scan_sports)}")
-    print(f"Minimum EV threshold: {min_ev:.1f}% | Min Arb ROI: {min_arb_roi:.1f}% | Max Bet Cap: ${max_bet_cap:.0f}")
+    print(f"[{now_utc.isoformat()}] Starting +EV & Arbitrage cron worker...")
+    print(f"Active sports: {', '.join(scan_sports) or 'none'}")
+    print(
+        f"Minimum EV threshold: {min_ev:.1f}% | "
+        f"Max EV cap: {'none' if max_ev is None else f'{max_ev:.1f}%'} | "
+        f"Min Arb ROI: {min_arb_roi:.1f}% | Max Bet Cap: ${max_bet_cap:.0f}"
+    )
     print(f"Configured PropLine API keys available: {len(keys_to_use)}")
 
     bot_token, chat_id = get_telegram_credentials()
     telegram_configured = bool(bot_token and chat_id)
-    if not telegram_configured:
+    discord_configured = bool(get_discord_webhook())
+    alerts_configured = telegram_configured or discord_configured
+    if not alerts_configured:
         print(
-            "WARNING: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured. "
-            "Alerts will be logged to console but not sent to Telegram."
+            "WARNING: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and DISCORD_WEBHOOK_URL "
+            "are not configured. Alerts will be logged to the console only."
         )
 
-    # Check for new members who joined and educate them with the onboarding guide
     if telegram_configured and not dry_run:
         check_and_welcome_new_members(bot_token, chat_id)
 
     if not keys_to_use:
         print(
-            "ERROR: PropLine API key is missing. Set PROPLINE_API_KEY environment variable.",
+            "ERROR: PropLine API key is missing. Set PROPLINE_API_KEY_1 and "
+            "PROPLINE_API_KEY_2 (or PROPLINE_API_KEY).",
             file=sys.stderr,
         )
         return {
@@ -714,50 +1059,74 @@ def run_worker(
             "arb_alerts_sent": 0,
         }
 
-    # 1. Fetch upcoming quotes with automated key rollover
-    fetch_result, active_key = fetch_odds_with_fallback(scan_sports, keys_to_use, mode="upcoming")
+    if not scan_sports:
+        print("No active sports to scan; skipping this cycle.")
+        return {
+            "success": True,
+            "quotes_fetched": 0,
+            "eligible_opportunities": 0,
+            "eligible_arbitrages": 0,
+            "ev_alerts_sent": 0,
+            "arb_alerts_sent": 0,
+            "tracked_bets": 0,
+            "sports_skipped": True,
+        }
+
+    fetch_result, active_key = fetch_odds_with_fallback(
+        scan_sports,
+        keys_to_use,
+        mode="upcoming",
+        now=now_utc,
+        quota_state_file=quota_state_file,
+    )
     quotes = fetch_result.get("quotes", [])
     errors = fetch_result.get("errors", [])
     warnings = fetch_result.get("warnings", [])
 
-    if errors:
-        for err in errors:
-            print(f"API Error: {err}", file=sys.stderr)
-    if warnings:
-        for warn in warnings:
-            print(f"API Warning: {warn}")
+    for error in errors:
+        print(f"API Error: {error}", file=sys.stderr)
+    for warning in warnings:
+        print(f"API Warning: {warning}")
 
     print(f"Fetched {len(quotes)} quotes across {len(scan_sports)} sports.")
 
-    # 2. Run EV calculation against Pinnacle
+    # +EV is Pinnacle-anchored and excludes player props by construction.
     scanner_cfg = replace(CONFIG, min_ev_pct=min_ev)
     scan_res = scan_pinnacle_ev(quotes, config=scanner_cfg, now=now_utc)
-    raw_opportunities = scan_res.get("opportunities", [])
+    raw_opportunities = [
+        opportunity
+        for opportunity in scan_res.get("opportunities", [])
+        if not is_player_prop_quote(opportunity)
+    ]
 
-    # Filter out games that have already started and EV < threshold
     valid_opportunities = []
-    for opp in raw_opportunities:
-        ev = float(opp.get("ev_pct", 0.0))
+    for opportunity in raw_opportunities:
+        ev = float(opportunity.get("ev_pct", 0.0))
         if ev < min_ev:
             continue
-        commence_time = opp.get("kickoff") or opp.get("commence_time")
+        if max_ev is not None and ev > max_ev:
+            continue
+        commence_time = opportunity.get("kickoff") or opportunity.get("commence_time")
         if is_game_started(commence_time, now_utc):
             continue
-        valid_opportunities.append(opp)
+        valid_opportunities.append(opportunity)
 
-    # Calculate Kelly stakes, capping any single bet at max_bet_cap ($300)
     if valid_opportunities:
         scan_stakes = calculate_capped_kelly_stakes(
             valid_opportunities,
             bankroll=CONFIG.bankroll,
             fraction=CONFIG.kelly_fraction,
         )
-        for opp, stake in zip(valid_opportunities, scan_stakes):
-            opp["kelly_stake"] = min(float(stake), max_bet_cap)
+        for opportunity, stake in zip(valid_opportunities, scan_stakes):
+            opportunity["kelly_stake"] = min(float(stake), max_bet_cap)
 
-    print(f"Found {len(valid_opportunities)} eligible +EV opportunities (>= {min_ev:.1f}% EV, max bet=${max_bet_cap:.0f}).")
+    print(
+        f"Found {len(valid_opportunities)} eligible +EV opportunities "
+        f"(>= {min_ev:.1f}% EV, max bet=${max_bet_cap:.0f})."
+    )
 
-    # 3. Run Arbitrage calculations, ensuring NO SINGLE BET exceeds max_bet_cap ($300)
+    # Arbitrage: Pinnacle is excluded inside the engine and only opportunities
+    # that guarantee at least $20 after rounding are kept.
     raw_arbs = find_arbitrage_opportunities(
         quotes,
         total_stake=ARBITRAGE_TARGET_TOTAL_STAKE,
@@ -770,47 +1139,47 @@ def run_worker(
         commence_time = arb.get("kickoff") or arb.get("commence_time")
         if is_game_started(commence_time, now_utc):
             continue
+        apply_arbitrage_size_limits(
+            arb,
+            max_leg_stake=max_bet_cap,
+            rounding_step=1,
+        )
         roi = float(arb.get("roi_pct", 0.0))
         if roi < min_arb_roi:
             continue
-
-        # Scale down if any leg exceeds max_bet_cap ($300)
-        max_leg_stake = max((float(leg.get("stake", 0.0)) for leg in arb.get("legs", [])), default=0.0)
-        if max_leg_stake > max_bet_cap and max_leg_stake > 0:
-            scale_ratio = max_bet_cap / max_leg_stake
-            scaled_total = int(math.floor(float(arb["total_stake"]) * scale_ratio))
-            if scaled_total >= 2:
-                odds = [float(leg["odds_decimal"]) for leg in arb["legs"]]
-                implied_sum = float(arb["implied_probability_sum"])
-                raw_stakes = [scaled_total * (1 / price) / implied_sum for price in odds]
-                scaled_stakes = _allocate_rounded_stakes(odds, scaled_total, 1, raw_stakes)
-                if scaled_stakes is not None and all(s <= max_bet_cap for s in scaled_stakes):
-                    payouts = [s * o for s, o in zip(scaled_stakes, odds)]
-                    guaranteed = min(payouts)
-                    profit = round(guaranteed - scaled_total, 2)
-                    if profit > 0:
-                        arb["total_stake"] = scaled_total
-                        arb["profit"] = profit
-                        arb["roi_pct"] = round(profit / scaled_total * 100, 2)
-                        arb["locked_payout"] = round(guaranteed, 2)
-                        for leg, s in zip(arb["legs"], scaled_stakes):
-                            leg["stake"] = s
-                            leg["payout"] = round(s * float(leg["odds_decimal"]), 2)
-
+        profit = float(arb.get("profit", 0.0))
         if (
-            float(arb.get("profit", 0.0)) > 0
-            and float(arb.get("roi_pct", 0.0)) >= min_arb_roi
-            and all(float(leg.get("stake", 0.0)) <= max_bet_cap for leg in arb.get("legs", []))
+            profit >= CONFIG.min_arb_guaranteed_profit_dollars - 1e-9
+            and all(
+                float(leg.get("stake", 0.0)) <= max_bet_cap
+                for leg in arb.get("legs", [])
+            )
         ):
             valid_arbs.append(arb)
 
-    print(f"Found {len(valid_arbs)} eligible Arbitrage opportunities (ROI >= {min_arb_roi:.1f}%, max bet=${max_bet_cap:.0f}).")
+    print(
+        f"Found {len(valid_arbs)} eligible Arbitrage opportunities "
+        f"(ROI >= {min_arb_roi:.1f}%, max bet=${max_bet_cap:.0f}, "
+        f"min profit=${CONFIG.min_arb_guaranteed_profit_dollars:.2f})."
+    )
 
-    # 4. Save cached odds
-    save_cached_odds(quotes, valid_opportunities, valid_arbs, scan_sports, now_utc, cache_file)
-    print(f"Saved {len(quotes)} quotes, {len(valid_opportunities)} EV opps, and {len(valid_arbs)} arbs to {cache_file}.")
+    # Cache is written atomically (.tmp + os.replace).
+    save_cached_odds(
+        quotes, valid_opportunities, valid_arbs, scan_sports, now_utc, cache_file
+    )
+    print(
+        f"Saved {len(quotes)} quotes, {len(valid_opportunities)} EV opps, and "
+        f"{len(valid_arbs)} arbs to {cache_file}."
+    )
 
-    # 5. Load and clean alert history
+    snapshots = scan_res.get("pinnacle_snapshots")
+    if snapshots is not None and not dry_run:
+        persist_scan_to_database(
+            now_utc,
+            scan_res.get("eligible_rows", valid_opportunities),
+            snapshots,
+        )
+
     history = load_alert_history(history_file)
     initial_history_count = len(history)
     history = clean_expired_history(history, now_ts, MAX_HISTORY_AGE_SECONDS)
@@ -818,57 +1187,52 @@ def run_worker(
     if pruned > 0:
         print(f"Pruned {pruned} alert history entries older than 48 hours.")
 
-    # 6. Evaluate and dispatch +EV alerts
     ev_alerts_sent = 0
-    for opp in valid_opportunities:
-        alert_key = build_alert_key(opp)
-        ev = float(opp.get("ev_pct", 0.0))
-
+    for opportunity in valid_opportunities:
+        alert_key = build_alert_key(opportunity)
+        ev = float(opportunity.get("ev_pct", 0.0))
         if not should_alert(alert_key, ev, history):
             continue
 
-        message = format_telegram_alert(opp)
-
-        if telegram_configured and not dry_run:
-            print(f"Sending Telegram +EV alert for {alert_key} (+{ev:.2f}% EV)...")
-            success = send_telegram_message(bot_token, chat_id, message)
-            if success:
+        message = format_telegram_alert(opportunity)
+        if alerts_configured and not dry_run:
+            print(f"Sending +EV alert for {alert_key} (+{ev:.2f}% EV)...")
+            if dispatch_alert(message):
                 ev_alerts_sent += 1
                 history[alert_key] = {"ev": ev, "timestamp": now_ts}
                 time.sleep(0.15)
+            else:
+                print(f"[FALLBACK +EV ALERT] {alert_key}:\n{message}\n")
         else:
             print(f"[CONSOLE +EV ALERT] {alert_key} (+{ev:.2f}% EV):\n{message}\n")
             ev_alerts_sent += 1
             history[alert_key] = {"ev": ev, "timestamp": now_ts}
 
-    # 7. Evaluate and dispatch Arbitrage alerts
     arb_alerts_sent = 0
     for arb in valid_arbs:
         arb_key = build_arbitrage_alert_key(arb)
         roi = float(arb.get("roi_pct", 0.0))
-
         if not should_alert_arbitrage(arb_key, roi, history):
             continue
 
         message = format_telegram_arbitrage_alert(arb)
-
-        if telegram_configured and not dry_run:
-            print(f"Sending Telegram Arbitrage alert for {arb_key} (+{roi:.2f}% ROI)...")
-            success = send_telegram_message(bot_token, chat_id, message)
-            if success:
+        if alerts_configured and not dry_run:
+            print(f"Sending Arbitrage alert for {arb_key} (+{roi:.2f}% ROI)...")
+            if dispatch_alert(message):
                 arb_alerts_sent += 1
                 history[arb_key] = {"roi": roi, "timestamp": now_ts}
                 time.sleep(0.15)
+            else:
+                print(f"[FALLBACK ARB ALERT] {arb_key}:\n{message}\n")
         else:
             print(f"[CONSOLE ARB ALERT] {arb_key} (+{roi:.2f}% ROI):\n{message}\n")
             arb_alerts_sent += 1
             history[arb_key] = {"roi": roi, "timestamp": now_ts}
 
-    # 8. Persist updated history
     save_alert_history(history, history_file)
     print(
-        f"Alert cycle complete. +EV alerts: {ev_alerts_sent}, Arb alerts: {arb_alerts_sent}. "
-        f"Total active tracked items: {len(history)}."
+        f"Alert cycle complete. +EV alerts: {ev_alerts_sent}, "
+        f"Arb alerts: {arb_alerts_sent}. Total active tracked items: {len(history)}."
     )
 
     return {
@@ -879,6 +1243,12 @@ def run_worker(
         "ev_alerts_sent": ev_alerts_sent,
         "arb_alerts_sent": arb_alerts_sent,
         "tracked_bets": len(history),
+        "request_count": fetch_result.get("request_count", 0),
+        "quota": fetch_result.get("quota", {}),
+        "api_key_used_index": keys_to_use.index(active_key) + 1
+        if active_key in keys_to_use
+        else None,
+        "failover_used": fetch_result.get("failover_used", False),
     }
 
 
@@ -889,8 +1259,7 @@ def main() -> None:
             print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.", file=sys.stderr)
             sys.exit(1)
         guide_text = format_welcome_guide()
-        success = send_telegram_message(bot_token, chat_id, guide_text)
-        if success:
+        if send_telegram_message(bot_token, chat_id, guide_text):
             print("Successfully sent onboarding guide to Telegram group.")
         else:
             print("Failed to send onboarding guide to Telegram group.", file=sys.stderr)
