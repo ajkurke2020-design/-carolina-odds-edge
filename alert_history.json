@@ -70,5 +70,41 @@
   "726307_Moneyline_Tampa Bay Buccaneers_None_ProphetX": {
     "ev": 3.429907414301303,
     "timestamp": 1795053682.268006
+  },
+  "720984_Total 33.5 (Georgia team)_Under_33.5_ProphetX": {
+    "ev": 6.090346997043261,
+    "timestamp": 1795055480.69707
+  },
+  "720664_Total 19.5 (East Carolina team)_Over_19.5_ProphetX": {
+    "ev": 3.5629431258800803,
+    "timestamp": 1795055480.69707
+  },
+  "720664_Total 45.5_Under_45.5_ProphetX": {
+    "ev": 3.5173882637737464,
+    "timestamp": 1795055480.69707
+  },
+  "720980_Spread +7_TCU_7.0_ProphetX": {
+    "ev": 3.4178766649517964,
+    "timestamp": 1795055480.69707
+  },
+  "721004_Total 17.5 (Illinois team)_Over_17.5_FanDuel": {
+    "ev": 3.3841543186067358,
+    "timestamp": 1795055480.69707
+  },
+  "721008_Total 22.5 (NC St. team)_Over_22.5_ProphetX": {
+    "ev": 3.378201276261139,
+    "timestamp": 1795055480.69707
+  },
+  "720999_Total 20.5 (Nebraska team)_Over_20.5_ProphetX": {
+    "ev": 3.2216259720715845,
+    "timestamp": 1795055480.69707
+  },
+  "721358_Spread +15.5_Old Dominion_15.5_ProphetX": {
+    "ev": 3.07512552293408,
+    "timestamp": 1795055480.69707
+  },
+  "arb_698151_Spread +18.5_Los Angeles Clippers_BetMGM-San Antonio Spurs_Novig": {
+    "roi": 1.142,
+    "timestamp": 1795055480.69707
   }
 }
